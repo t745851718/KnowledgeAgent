@@ -47,3 +47,20 @@ test('injects the trusted owner into JSON requests', async (t) => {
   await fetch(`http://127.0.0.1:${server.address().port}/api/v1/chat/completions`, { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({ message:'hi' }) });
   assert.equal(forwarded.owner_id, 'user_test');
 });
+
+test('filters internal fields from public document responses', async (t) => {
+  const app = createApp({ serverBaseUrl:'http://core.test', fetchImpl: async () => new Response(JSON.stringify({
+    items:[{
+      id:'doc_1', owner_id:'user_test', name:'guide.md',
+      storage_path:'/private/uploads/doc_1/source.md',
+      volume_path:'documents/user_test/doc_1/source.md',
+      sha256:'internal-hash', idempotency_key:'upload-key',
+    }],
+    next_cursor:null, has_more:false,
+  }), { status:200, headers:{'content-type':'application/json'} }) });
+  const server = app.listen(0); t.after(() => server.close());
+  await new Promise((resolve) => server.once('listening', resolve));
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/api/v1/documents`);
+  const payload = await response.json();
+  assert.deepEqual(payload.data.items, [{ id:'doc_1', name:'guide.md' }]);
+});

@@ -4,7 +4,7 @@ const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
 
-const DEFAULT_PORT = 3000;
+const DEFAULT_PORT = 3001;
 
 function createApp(options = {}) {
   const app = express();
@@ -109,7 +109,27 @@ function normalizeData(payload, method, path) {
   if (method === 'POST' && path === '/documents' && payload?.document_id && !payload.status_url) {
     return { ...payload, status_url: `/api/v1/documents/${payload.document_id}` };
   }
+  if (method === 'GET' && path === '/documents' && Array.isArray(payload?.items)) {
+    return { ...payload, items: payload.items.map(sanitizeDocument) };
+  }
+  if (method === 'GET' && path.startsWith('/documents/')) return sanitizeDocument(payload);
+  if (method === 'POST' && path === '/conversations') return sanitizeOwner(payload);
+  if (method === 'GET' && path === '/conversations' && Array.isArray(payload?.items)) {
+    return { ...payload, items: payload.items.map(sanitizeOwner) };
+  }
   return payload;
+}
+
+function sanitizeDocument(payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return payload;
+  const { owner_id, storage_path, volume_path, sha256, idempotency_key, ...document } = payload;
+  return document;
+}
+
+function sanitizeOwner(payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return payload;
+  const { owner_id, ...resource } = payload;
+  return resource;
 }
 
 function normalizeError(payload, status, requestId) {

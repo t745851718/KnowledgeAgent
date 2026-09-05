@@ -2,16 +2,16 @@
 
 ## 1. 文档说明
 
-本文档根据 [`doc.md`](./doc.md) 与 [`schema.md`](./schema.md) 中描述的目标和技术架构编写，用于约定 KnowledgeAgent 的 HTTP 接口。
+本文档描述 KnowledgeAgent 已实现的 v1 HTTP 接口，并与 `app/web`、`app/server` 的实际行为保持一致。产品目标和早期技术设想分别见 [`doc.md`](./doc.md) 与 [`schema.md`](./schema.md)；若它们与本文档冲突，以本文档和 FastAPI OpenAPI 为准。
 
-当前仓库尚未包含 `app/web` 和 `app/server` 的接口实现，因此本文档是 **v1 接口设计草案**，不是已上线接口的行为记录。开发过程中如调整路径、字段或状态码，应同步更新本文档和 FastAPI 的 OpenAPI 定义。
+接口已完成本地自动化测试和真实云端端到端联调，但仍属于开发阶段，尚未提供正式登录系统、持久化任务队列和生产级多实例协调。
 
 系统分为两层接口：
 
-- **Web API**：由 Express 提供，供浏览器调用。默认示例地址为 `http://localhost:3000/api/v1`。
+- **Web API**：由 Express 提供，供浏览器调用。默认示例地址为 `http://localhost:3001/api/v1`。
 - **Server API**：由 FastAPI 提供，供 Express 内部调用。默认示例地址为 `http://localhost:8000/internal/v1`，不应直接暴露到公网。
 
-v1 计划支持以下主要能力：
+v1 已支持以下主要能力：
 
 1. 上传 PDF、Word 或 Markdown 文档。
 2. 查询文档解析和向量化状态。
@@ -35,11 +35,15 @@ sequenceDiagram
 
     Browser->>Express: 上传文档
     Express->>FastAPI: 转发文件并创建入库任务
-    FastAPI->>Zilliz: 保存原文件
+    FastAPI->>FastAPI: 原文件保存到本地目录
+    FastAPI-->>Express: 202 queued
+    Express-->>Browser: 文档已接收
+    FastAPI->>Zilliz: 可选镜像原文件到 Managed Volume
     FastAPI->>MinerU: 解析 PDF/Word 为 Markdown
     FastAPI->>Bailian: 生成文本向量
     FastAPI->>Zilliz: 写入文本块和向量
-    Express-->>Browser: 查询到 indexed 状态
+    Browser->>Express: 轮询文档状态
+    Express-->>Browser: indexed
 
     Browser->>Express: 发送聊天问题
     Express->>FastAPI: 发起 RAG 查询
@@ -60,14 +64,14 @@ sequenceDiagram
 - 文件上传使用 `Content-Type: multipart/form-data`，该请求头及 boundary 应由浏览器或 HTTP 客户端自动生成。
 - 流式聊天响应使用 `Content-Type: text/event-stream`。
 - 字符编码统一为 UTF-8。
-- URL 中的资源 ID 建议使用 UUID。
+- 服务端生成带资源前缀的、可按时间排序的 ID，例如 `doc_...`、`conv_...`、`msg_...` 和 `req_...`；客户端只应将其视为不透明字符串。
 - 时间字段使用 ISO 8601 UTC 格式，例如 `2026-03-10T08:30:00Z`。
 
 ### 3.2 身份认证
 
-当前 README 没有定义用户系统，因此 v1 草案暂不规定登录接口。开发环境可以不启用鉴权；生产环境建议由 Express 校验登录态或 `Authorization: Bearer <token>`，并从登录态取得 `user_id`，不要信任客户端提交的用户 ID。
+v1 暂未实现登录接口。Express 在开发环境中使用 `DEVELOPMENT_OWNER_ID`，默认值为 `development-user`，并通过 `X-Owner-Id` 向 FastAPI 传递可信身份。JSON 请求中的浏览器 `owner_id` 会被 Express 覆盖，multipart 上传也由请求头决定 owner。生产环境必须改为从经过验证的服务端登录态取得 owner ID，不得信任客户端提交的用户 ID。
 
-FastAPI 内部接口建议使用仅服务端持有的令牌：
+FastAPI 支持通过 `INTERNAL_API_TOKEN` 启用内部 Bearer Token：
 
 ```http
 Authorization: Bearer <internal-service-token>
@@ -77,7 +81,7 @@ Authorization: Bearer <internal-service-token>
 
 ### 3.3 成功响应
 
-非流式接口使用统一响应结构：
+Web API 的非流式接口使用统一响应结构；FastAPI 内部接口直接返回业务数据或错误结构，由 Express 负责包装：
 
 ```json
 {
@@ -117,16 +121,17 @@ Authorization: Bearer <internal-service-token>
 | `403` | `FORBIDDEN` | 无权访问指定文档或会话 |
 | `404` | `DOCUMENT_NOT_FOUND` | 文档不存在 |
 | `404` | `CONVERSATION_NOT_FOUND` | 会话不存在 |
-| `409` | `DOCUMENT_ALREADY_EXISTS` | 同一知识库中已存在相同文件 |
+| `409` | `DOCUMENT_NOT_READY` | 指定文档尚未完成入库 |
+| `409` | `REQUEST_ID_CONFLICT` | 同一请求 ID 被用于不同的问答参数 |
 | `413` | `FILE_TOO_LARGE` | 文件超过服务端配置的大小限制 |
 | `415` | `UNSUPPORTED_FILE_TYPE` | 文件扩展名或 MIME 类型不受支持 |
 | `422` | `VALIDATION_ERROR` | JSON 或表单字段校验失败 |
-| `429` | `RATE_LIMITED` | 请求频率超过限制或上游服务限流 |
 | `500` | `INTERNAL_ERROR` | 未分类的服务内部错误 |
-| `502` | `UPSTREAM_SERVICE_ERROR` | MinerU、百炼或 Zilliz 调用失败 |
-| `503` | `SERVICE_UNAVAILABLE` | 必要依赖暂时不可用 |
+| `502` | `UPSTREAM_SERVICE_ERROR` | MinerU 或百炼调用失败 |
+| `503` | `UPSTREAM_SERVICE_ERROR` | Zilliz、Volume 或本地存储调用失败 |
+| `503` | `SERVICE_UNAVAILABLE` | 就绪检查发现必要依赖不可用 |
 
-服务端应在响应头返回 `X-Request-Id`，并在日志、错误响应及内部服务调用中传递该值，以便定位一次完整调用。
+Express 和 FastAPI 都会在响应头返回 `X-Request-Id`，错误响应也包含该值。现有 Provider 适配器尚未把它作为上游请求头传给 MinerU、百炼或 Zilliz。
 
 ### 3.5 分页
 
@@ -153,7 +158,7 @@ Authorization: Bearer <internal-service-token>
 
 ### 3.6 幂等与重试
 
-- 文档上传可携带 `Idempotency-Key` 请求头。相同用户在 24 小时内使用相同 key 重试时，服务端应返回第一次创建的文档任务。
+- 文档上传可携带 `Idempotency-Key` 请求头。相同用户在 24 小时内使用相同 key 重试时，服务端返回第一次创建的文档任务；未提供 key 时允许上传内容相同的文件。
 - GET 请求可以安全重试。
 - 遇到 `429`、`502` 或 `503` 时，客户端应使用指数退避重试，并优先遵循响应头 `Retry-After`。
 - SSE 连接中断后，客户端可以重新发起聊天请求；若要避免生成重复消息，应复用同一个 `request_id`。
@@ -269,7 +274,7 @@ Authorization: Bearer <internal-service-token>
 
 #### `POST /api/v1/documents`
 
-接收一个文档并创建异步入库任务。接口在文件完成持久化且任务成功进入队列后返回，不等待 MinerU 解析和向量化结束。
+接收一个文档并创建异步入库任务。接口在原文件完成本地持久化、MongoDB 文档记录创建完成且进程内任务成功登记后返回，不等待 Managed Volume 镜像、MinerU 解析和向量化结束。
 
 请求头：
 
@@ -285,7 +290,7 @@ Idempotency-Key: 91862a89-1cb1-4b43-9498-d5f733e91963
 | `file` | binary | 是 | PDF、Word 或 Markdown 文件 |
 | `metadata` | JSON string | 否 | 自定义元数据，例如来源、标签 |
 
-建议支持的文件类型：
+已支持的文件类型：
 
 | 文件类型 | 扩展名 | MIME 类型示例 | 解析方式 |
 | --- | --- | --- | --- |
@@ -293,7 +298,7 @@ Idempotency-Key: 91862a89-1cb1-4b43-9498-d5f733e91963
 | Word | `.doc`、`.docx` | `application/msword`、`application/vnd.openxmlformats-officedocument.wordprocessingml.document` | MinerU 转 Markdown |
 | Markdown | `.md`、`.markdown` | `text/markdown`、`text/plain` | 直接读取并统一切分 |
 
-服务端应同时校验扩展名、MIME 类型和文件内容特征。文件大小上限由部署配置决定；超过限制返回 `413 FILE_TOO_LARGE`。
+服务端同时校验扩展名、MIME 类型和文件内容特征。文件大小上限由部署配置决定；超过限制返回 `413 FILE_TOO_LARGE`。
 
 响应：`202 Accepted`
 
@@ -312,7 +317,7 @@ Idempotency-Key: 91862a89-1cb1-4b43-9498-d5f733e91963
 cURL 示例：
 
 ```bash
-curl -X POST 'http://localhost:3000/api/v1/documents' \
+curl -X POST 'http://localhost:3001/api/v1/documents' \
   -H 'Idempotency-Key: 91862a89-1cb1-4b43-9498-d5f733e91963' \
   -F 'file=@./test/data/AttentionIsAllYouNeed.pdf' \
   -F 'metadata={"source":"manual-upload","tags":["paper","transformer"]}'
@@ -408,7 +413,7 @@ curl -X POST 'http://localhost:3000/api/v1/documents' \
 
 #### `DELETE /api/v1/documents/{document_id}`
 
-删除原文件、解析产物和对应的 Zilliz 向量。删除过程可以异步执行；接受删除请求后，查询接口可能暂时返回 `deleting`。
+同步删除 MongoDB 文档记录、本地原文件、解析产物和对应的 Zilliz 向量。处理过程中内部状态为 `deleting`，所有清理成功后返回 204；失败时文档进入 `failed` 并返回错误。Managed Volume 中的单个文件不会自动删除，见第 6.4 节。
 
 响应：`204 No Content`
 
@@ -428,7 +433,7 @@ curl -X POST 'http://localhost:3000/api/v1/documents' \
 
 | 字段 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| `title` | string | 否 | 会话标题；省略时可在首次提问后自动生成 |
+| `title` | string | 否 | 会话标题；省略或为空时使用“新会话” |
 
 响应：`201 Created`
 
@@ -465,11 +470,11 @@ curl -X POST 'http://localhost:3000/api/v1/documents' \
 
 响应：`204 No Content`
 
-### 5.10 RAG 流式问答
+### 5.10 RAG 问答
 
 #### `POST /api/v1/chat/completions`
 
-根据用户问题检索 Zilliz 中的知识片段，使用 rerank 模型重排，再由大语言模型生成答案。回答和引用通过 SSE 返回。
+根据用户问题检索 Zilliz 中的知识片段，使用 rerank 模型重排，再由大语言模型生成答案。默认通过 SSE 返回；请求中显式设置 `stream=false` 时返回普通 JSON，结构与第 6.5 节一致。
 
 请求头：
 
@@ -497,13 +502,14 @@ Accept: text/event-stream
 | `message` | string | 是 | 用户问题；去除首尾空白后不能为空 |
 | `document_ids` | string[] | 否 | 限制检索范围；省略或空数组表示检索当前用户全部已入库文档 |
 | `request_id` | string | 否 | 客户端生成的请求 ID，用于重连去重和问题排查 |
+| `stream` | boolean | 否 | 是否使用 SSE；默认 `true` |
 
 只有 `status=indexed` 的文档可以参与问答。若指定文档仍在处理中，返回 `409 DOCUMENT_NOT_READY`。
 
 cURL 示例：
 
 ```bash
-curl -N -X POST 'http://localhost:3000/api/v1/chat/completions' \
+curl -N -X POST 'http://localhost:3001/api/v1/chat/completions' \
   -H 'Content-Type: application/json' \
   -H 'Accept: text/event-stream' \
   -d '{
@@ -517,7 +523,7 @@ curl -N -X POST 'http://localhost:3000/api/v1/chat/completions' \
 
 每个事件由 `event` 和 `data` 两行组成，事件之间用空行分隔。`data` 是单行 JSON。
 
-1. `start`：已创建消息，开始处理。
+1. `start`：已分配 assistant 消息 ID，开始生成；消息会在回答完成后持久化。
 
 ```text
 event: start
@@ -576,7 +582,7 @@ Express 转发资源查询、删除和 multipart 上传时，应设置 `X-Owner-
 
 #### `GET /internal/v1/health/ready`
 
-检查 FastAPI、MongoDB 和 Zilliz 的基本连通性。是否探测 MinerU、百炼等按次计费服务，可通过部署配置控制。
+检查 FastAPI、MongoDB 和 Zilliz 的基本连通性。现有实现不调用 MinerU、百炼等按次计费服务，响应中将其标记为 `not_checked`。
 
 响应：`200 OK`
 
@@ -606,17 +612,18 @@ Express 将浏览器上传的 multipart 请求转发至该接口。字段与 Web
 | `owner_id` | string | 是 | Express 从登录态取得的用户 ID |
 | `metadata` | JSON string | 否 | 文档元数据 |
 
-接口接受可选的 `Idempotency-Key` 请求头，相同 owner 在 24 小时内复用该值时返回第一次创建的任务。
+接口接受可选的 `Idempotency-Key` 请求头，相同 owner 在 24 小时内复用该值时返回第一次创建的任务。该幂等记录保存在 MongoDB；未配置 MongoDB 时只在当前进程生命周期内有效。
 
 处理步骤：
 
 1. 校验文件并生成 `document_id`。
-2. 将原文件保存到 Zilliz Volume。
-3. PDF/Word 通过 MinerU 转为 Markdown；Markdown 直接进入下一步。
-4. 使用统一的 text splitter 生成文本块，并保留页码、标题层级等元数据。
-5. 使用 `qwen3-vl-embedding` 生成 dense 向量，使用 `qwen3.7-text-embedding` 生成 sparse 向量。
-6. 将文本块、向量和文档元数据写入 Zilliz Collection。
-7. 更新状态为 `indexed`；任一步骤失败则更新为 `failed` 并保存可诊断的错误信息。
+2. 将原文件保存到本地 `UPLOAD_DIR`，创建 MongoDB 文档记录并启动进程内异步任务。
+3. 若 Managed Volume 配置完整，将本地原文件镜像到 Zilliz Volume。
+4. PDF/Word 通过 MinerU 转为 Markdown；Markdown 直接进入下一步。
+5. 使用统一的 text splitter 生成文本块，并尽可能保留页码、标题层级、列表、表格和图表说明。
+6. 每批最多 20 条，使用 `qwen3-vl-embedding` 生成 dense 向量，使用 `qwen3.7-text-embedding` 生成 sparse 向量。
+7. 将文本块、向量和文档元数据写入 Zilliz Collection。
+8. 更新状态为 `indexed`；任一步骤失败则更新为 `failed` 并保存可诊断的错误信息。
 
 响应：`202 Accepted`
 
@@ -633,7 +640,7 @@ Express 将浏览器上传的 multipart 请求转发至该接口。字段与 Web
 
 #### `GET /internal/v1/documents/{document_id}`
 
-返回内部 Document 数据。Express 在转发给浏览器前应校验资源归属，并过滤存储路径、上游任务 ID、内部堆栈等敏感字段。
+返回内部 Document 数据。FastAPI 已按 `X-Owner-Id` 校验资源归属。内部响应可能包含 `owner_id`、`storage_path`、`volume_path`、`sha256` 和 `idempotency_key` 等字段；Express 返回浏览器前会过滤这些内部字段。
 
 ### 6.4 删除文档
 
@@ -667,7 +674,7 @@ Express 将浏览器上传的 multipart 请求转发至该接口。字段与 Web
 | `request_id` | string | 否 | 贯穿整条链路的请求 ID；省略时使用 `X-Request-Id` |
 | `stream` | boolean | 否 | 是否流式返回，默认 `true` |
 
-建议的 RAG 流程：
+已实现的 RAG 流程：
 
 1. 校验会话和文档均属于 `owner_id`。
 2. 将用户消息写入 MongoDB。
@@ -699,7 +706,7 @@ Express 将浏览器上传的 multipart 请求转发至该接口。字段与 Web
 
 ### 6.6 文档列表与会话接口
 
-为承接第 5 节的 Express Web API，FastAPI 同时提供以下内部接口。请求必须携带可信的 `X-Owner-Id`，响应数据结构与对应 Web API 的 `data` 字段一致。
+为承接第 5 节的 Express Web API，FastAPI 同时提供以下内部接口。请求必须携带可信的 `X-Owner-Id`，响应主体与对应 Web API 的 `data` 字段一致；Express 再包装为统一的 `{code,message,data}` 结构。
 
 - `GET /internal/v1/documents`
 - `POST /internal/v1/conversations`
@@ -707,15 +714,15 @@ Express 将浏览器上传的 multipart 请求转发至该接口。字段与 Web
 - `GET /internal/v1/conversations/{conversation_id}/messages`
 - `DELETE /internal/v1/conversations/{conversation_id}`
 
-列表接口支持 `limit` 和 `cursor`；文档列表额外支持 `status`。FastAPI 会按 owner 过滤资源，其他 owner 的资源按不存在处理。
+列表接口支持 `limit` 和 `cursor`；文档列表额外支持 `status`。FastAPI 会按 owner 过滤资源，其他 owner 的资源按不存在处理。现有实现先从 Repository 读取记录，再在 Python 中执行 ID 游标分页；数据量较大时应改为数据库排序键游标。
 
 ---
 
-## 7. 数据存储建议
+## 7. 数据存储实现
 
 ### 7.1 MongoDB
 
-建议至少包含以下集合：
+MongoDB 使用以下集合：
 
 | 集合 | 主要字段 | 用途 |
 | --- | --- | --- |
@@ -723,16 +730,17 @@ Express 将浏览器上传的 multipart 请求转发至该接口。字段与 Web
 | `conversations` | `_id`、`owner_id`、`title`、时间字段 | 保存会话 |
 | `messages` | `_id`、`conversation_id`、`role`、`content`、`citations`、`request_id`、时间字段 | 保存聊天记录 |
 
-建议索引：
+服务启动时创建以下索引：
 
 - `documents`: `{ owner_id: 1, created_at: -1 }`
+- `documents`: `{ owner_id: 1, idempotency_key: 1 }`，partial unique
 - `conversations`: `{ owner_id: 1, updated_at: -1 }`
 - `messages`: `{ conversation_id: 1, created_at: 1 }`
-- `messages`: `{ request_id: 1 }`，设置为唯一索引以避免重试产生重复消息
+- `messages`: `{ request_id: 1 }`，unique sparse，用于避免重试产生重复 assistant 消息
 
 ### 7.2 Zilliz Collection
 
-每个文本块建议包含：
+每个文本块包含：
 
 | 字段 | 说明 |
 | --- | --- |
@@ -748,7 +756,7 @@ Express 将浏览器上传的 multipart 请求转发至该接口。字段与 Web
 
 向量维度必须与实际模型配置保持一致。服务端使用双模型生成混合检索向量：`dense_vector` 来自 `qwen3-vl-embedding`，`sparse_vector` 来自 `qwen3.7-text-embedding`。文档入库和查询必须使用相同的模型组合，不能把不同模型生成的 dense 向量写入或查询同一个字段。
 
-原文件保存到 Zilliz Volume 时，建议使用不可猜测且无路径穿越风险的对象路径，例如：
+原文件镜像到 Zilliz Volume 时使用经过路径片段校验的对象路径：
 
 ```text
 documents/{owner_id}/{document_id}/source.pdf
@@ -758,15 +766,16 @@ documents/{owner_id}/{document_id}/source.pdf
 
 ---
 
-## 8. 配置项建议
+## 8. 配置项
 
-具体变量名可在实现阶段调整，但服务端至少需要以下配置：
+实现读取以下主要环境变量：
 
 | 配置 | 用途 |
 | --- | --- |
 | `WEB_PORT` | Express 监听端口 |
 | `SERVER_BASE_URL` | Express 调用 FastAPI 的地址 |
 | `INTERNAL_API_TOKEN` | Web 与 Server 之间的内部鉴权令牌 |
+| `DEVELOPMENT_OWNER_ID` | Web 开发环境 owner，默认 `development-user` |
 | `MONGODB_URI` | MongoDB 连接串 |
 | `MONGODB_DATABASE` | MongoDB 数据库名 |
 | `BAILIAN_BASE_URL` | 百炼 OpenAI 兼容接口地址 |
@@ -774,26 +783,43 @@ documents/{owner_id}/{document_id}/source.pdf
 | `EMBEDDING_MODEL` | dense 向量模型，默认 `qwen3-vl-embedding` |
 | `SPARSE_EMBEDDING_MODEL` | sparse 向量模型，默认 `qwen3.7-text-embedding` |
 | `EMBEDDING_DIMENSION` | dense 向量维度，默认 `1024` |
+| `RERANK_MODEL` | 重排模型，默认 `qwen3.7-text-rerank` |
+| `CHAT_MODEL` | 对话模型，默认 `deepseek-v4-flash` |
 | `MINERU_API_KEY` | MinerU API 密钥 |
+| `MINERU_API_BASE` | MinerU API 地址，默认 `https://mineru.net/api/v4` |
+| `MINERU_MODEL` | MinerU 模型版本，默认 `vlm` |
 | `ZILLIZ_URI` | Zilliz/Milvus Endpoint |
 | `ZILLIZ_TOKEN` | Zilliz 数据库令牌 |
 | `ZILLIZ_COLLECTION` | 文本块 Collection 名称，默认 `knowledge_agent_chunks_vl_v1`；更换 dense 模型时应使用新 Collection 或全量重建 |
 | `ZILLIZ_API_KEY` | Zilliz Cloud Volume API 密钥 |
 | `ZILLIZ_VOLUME_NAME` | 原文件 Volume 名称 |
 | `MAX_UPLOAD_SIZE` | 单文件上传上限 |
+| `UPLOAD_DIR` | 本地原文件目录，默认 `data/uploads` |
+| `PROCESSING_DIR` | MinerU 处理结果目录，默认 `data/processing` |
+| `CHUNK_SIZE` | chunk 字符数，默认 `1200` |
+| `CHUNK_OVERLAP` | chunk 重叠字符数，默认 `200` |
+| `RETRIEVAL_LIMIT` | 混合检索返回数，默认 `20` |
+| `RERANK_LIMIT` | Rerank 返回数，默认 `6` |
 
 所有密钥只保存在服务端环境变量或密钥管理服务中，不应提交到 Git、写入前端代码或通过 API 响应返回。
 
 ---
 
-## 9. 实现验收清单
+## 9. 验收状态
 
-- FastAPI 自动生成的 `/docs` 与本文档中的请求和响应保持一致。
-- 上传 PDF、Word、Markdown 后均可观察到完整状态流转，并最终达到 `indexed`。
-- 解析或向量化失败时文档进入 `failed`，且用户能看到可理解的错误信息。
-- 指定 `document_ids` 后，检索结果不会混入范围外的文档。
-- 不同用户不能查询、删除或检索彼此的文档和会话。
-- SSE 能正确处理中文、多段 `delta`、引用、正常结束及中途错误。
+### 9.1 已验证
+
+- FastAPI OpenAPI 可以正常生成。
+- PDF 和 Markdown 可观察到完整状态流转并达到 `indexed`；Word 使用与 PDF 相同的 MinerU 路由，已有 Provider 级测试，但本轮未重新上传 Word。
+- 指定 `document_ids` 的检索范围、owner 数据隔离和上传/问答幂等已有自动化测试。
+- SSE 已验证中文、多段 `delta`、引用和正常结束；流内错误协议已实现，仍需补充专门的自动化用例。
+- 删除文档后，MongoDB 元数据、本地原文件、MinerU 解析产物和 Zilliz 向量可以清理；Managed Volume 单文件除外。
+- 2026-09-05 经 Express Web API 完成真实 PDF 端到端联调：64 个 chunks、两次 RAG 回答、4 条持久化消息，随后完成临时数据清理。
+
+### 9.2 上线前待完成
+
 - 客户端断开连接后，服务端取消无用的模型生成，或继续完成并可靠保存结果；两种策略需固定一种并测试。
-- 删除文档后，其原文件、解析产物和向量均被删除。
-- 日志不记录 API Key、Token、完整文件内容或不必要的用户隐私数据。
+- 将进程内入库任务替换为持久化任务队列，并补充重试和恢复测试。
+- 为多 worker 部署增加数据库级幂等、任务租约和会话并发协调。
+- 接入正式登录态，移除固定的 `DEVELOPMENT_OWNER_ID`。
+- 建立自动化的密钥和日志敏感信息扫描。
