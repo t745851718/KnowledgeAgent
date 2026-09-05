@@ -2,12 +2,14 @@
   "name": "knowledgeagent",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "app/web/server.js",
   "directories": {
     "test": "test"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node app/web/server.js",
+    "dev": "node --watch app/web/server.js",
+    "test": "node --test app/web/test/*.test.js"
   },
   "repository": {
     "type": "git",
