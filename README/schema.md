@@ -1,19 +1,16 @@
-# 知识库问答
+# 技术栈架构
 
-![img.png](asset/img.png)
+## web
+1. Express
 
-这是一个知识库问答智能体项目，最终的效果是一个页面
+## server
+FastAPI开放接口
+1. RAG:   
+langgraph + llm(deepseek-v4-flash) + embed(多模态: qwen3-vl-embedding) + rerank(qwen3.7-text-rerank)
 
-页面上用户能上传文档，然后后台会将这个文档嵌入到Milvus
+2. 解析文档   
+- 接收Word, PDF, md文档, 动态路由，配置不同类型文件不同处理，目前Word，PDF都用MinerU解析为md, 然后md用text_split统一处理
+- 由embed转为向量存入zilliz, 原文件写入zilliz-volume
 
-然后页面上用户还能和agent聊天，比如问“xxx”问题，agent会通过RAG去检索然后回答用户问题
-
-llm: deepseek-v4-flash
- 
-retrieve: qwen3.7-text-embedding + qwen3.7-text-rerank
-
-vector + origin: Zilliz cloud
-
-chat history: MongoDB cloud
-
-PDF parser: MinerU API
+## utils
+- MongoDB存储用户对话记录

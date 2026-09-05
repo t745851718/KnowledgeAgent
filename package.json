@@ -1,0 +1,27 @@
+{
+  "name": "knowledgeagent",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "directories": {
+    "test": "test"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/t745851718/KnowledgeAgent.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/t745851718/KnowledgeAgent/issues"
+  },
+  "homepage": "https://github.com/t745851718/KnowledgeAgent#readme",
+  "dependencies": {
+    "express": "^5.2.1"
+  }
+}
