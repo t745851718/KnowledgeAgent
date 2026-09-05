@@ -128,10 +128,46 @@ function addMessage(role, content = '', citations = []) {
   const node = document.createElement('article');
   node.className = `message ${role}`;
   node.innerHTML = `<div class="avatar">${role === 'assistant' ? '✦' : '你'}</div><div class="message-body"><div class="message-role">${role === 'assistant' ? 'KnowledgeAgent' : '你'}</div><div class="message-content"></div><div class="citations"></div></div>`;
-  node.querySelector('.message-content').textContent = content;
+  renderMarkdown(node.querySelector('.message-content'), content);
   renderCitations(node.querySelector('.citations'), citations);
   els.messages.append(node); scrollChat();
   return node;
+}
+
+// Render the model's Markdown without allowing model output to inject arbitrary HTML.
+function renderMarkdown(container, markdown = '') {
+  const escaped = String(markdown)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  const blocks = escaped.split(/```([\w+-]*)\n?([\s\S]*?)```/g);
+  let html = '';
+  for (let index = 0; index < blocks.length; index += 3) {
+    html += inlineMarkdown(blocks[index]);
+    if (blocks[index + 1] !== undefined) {
+      html += `<pre><code class="language-${blocks[index + 1] || 'text'}">${blocks[index + 2].trim()}</code></pre>`;
+    }
+  }
+  container.innerHTML = html;
+}
+
+function inlineMarkdown(value) {
+  let html = value.replace(/^### (.+)$/gm, '<h3>$1</h3>')
+    .replace(/^## (.+)$/gm, '<h2>$1</h2>')
+    .replace(/^# (.+)$/gm, '<h1>$1</h1>')
+    .replace(/^[-*] (.+)$/gm, '<li>$1</li>')
+    .replace(/^(\d+)\. (.+)$/gm, '<li>$2</li>')
+    .replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>')
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/__(.+?)__/g, '<strong>$1</strong>')
+    .replace(/\*([^*\n]+)\*/g, '<em>$1</em>')
+    .replace(/_([^_\n]+)_/g, '<em>$1</em>')
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  html = html.replace(/(?:<li>[^\n]*<\/li>\n?)+/g, (list) => `<ul>${list}</ul>`);
+  return html.split(/\n{2,}/).map((paragraph) => {
+    if (/^<(h[1-3]|ul|blockquote|pre)/.test(paragraph.trim())) return paragraph;
+    return paragraph.trim() ? `<p>${paragraph.replace(/\n/g, '<br>')}</p>` : '';
+  }).join('');
 }
 
 function renderCitations(container, citations = []) {
@@ -164,7 +200,8 @@ async function sendMessage(text) {
     });
     if (!response.ok) { const error = await response.json().catch(() => ({})); throw new Error(error.message || `请求失败 (${response.status})`); }
     await consumeSSE(response.body, (event, data) => {
-      if (event === 'delta') content.textContent += data.content || '';
+      if (event === 'delta') renderMarkdown(content, `${content.dataset.raw || ''}${data.content || ''}`);
+      if (event === 'delta') content.dataset.raw = `${content.dataset.raw || ''}${data.content || ''}`;
       if (event === 'citations') renderCitations(assistant.querySelector('.citations'), data.items);
       if (event === 'error') throw new Error(data.message || '回答生成失败');
       scrollChat();
