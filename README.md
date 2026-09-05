@@ -1,7 +1,7 @@
 # KnowledgeAgent
 
 一个面向个人知识库的文档问答（RAG）项目。用户可以上传 PDF、DOC、DOCX 或 Markdown 文档，系统完成文档解析、文本切分、双路向量化、混合检索、重排，并通过流式或非流式接口返回带引用的回答。
-
+![img.png](README/asset/readme-12314235223414.png)
 ## 项目特点
 
 - 支持 PDF、DOC、DOCX、Markdown 文档上传
