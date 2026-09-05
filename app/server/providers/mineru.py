@@ -155,7 +155,13 @@ class MinerUProvider:
         except (OSError, urllib.error.URLError, TimeoutError, zipfile.BadZipFile) as exc:
             raise ProviderError("mineru", f"下载或解压结果失败: {exc}", retryable=True) from exc
 
-    def parse_document(self, document: str | Path, *, document_id: str) -> MinerUResult:
+    def parse_document(
+        self,
+        document: str | Path,
+        *,
+        document_id: str,
+        output_root: str | Path | None = None,
+    ) -> MinerUResult:
         source = Path(document).resolve()
         if not source.is_file():
             raise ProviderError("mineru", f"文档不存在: {source}")
@@ -167,7 +173,8 @@ class MinerUProvider:
             batch_id, upload_url = self._create_task(source, document_id)
             self._upload(source, upload_url)
             result_url = self._wait(batch_id)
-            work_dir = (self.output_root / document_id).resolve()
+            root = Path(output_root) if output_root is not None else self.output_root
+            work_dir = (root / document_id).resolve()
             self._download_extract(result_url, work_dir)
             markdown_paths = sorted(work_dir.rglob("full.md"))
             if not markdown_paths:

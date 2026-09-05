@@ -2,6 +2,7 @@
 
 from .models import (
     Citation,
+    RetrievedImage,
     Conversation,
     ConversationCreate,
     Document,
@@ -17,6 +18,7 @@ from .models import (
 
 __all__ = [
     "Citation",
+    "RetrievedImage",
     "Conversation",
     "ConversationCreate",
     "Document",

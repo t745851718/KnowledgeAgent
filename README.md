@@ -11,6 +11,7 @@
 - 使用 MongoDB 保存文档、会话、消息和回答引用
 - 支持 SSE 流式输出回答和引用
 - 支持 `request_id` 幂等，降低客户端重试造成重复回答的风险
+- LangGraph 编排入库与 RAG，双路嵌入并行，图文融合请求有界并发
 - 前后端分离：Express Web 层代理 FastAPI 内部服务
 
 ## 系统架构
@@ -27,14 +28,14 @@ FastAPI Server :8000
   ├── Bailian / DashScope  向量化、重排、对话生成
   ├── Zilliz / Milvus      dense+sparse 混合检索
   ├── MongoDB              文档与会话数据
-  └── Local / Zilliz Volume 原文件存储
+  └── MinIO                原文件对象存储
 ```
 
 ### 文档入库流程
 
 ```text
 上传文件
-  → 本地保存与创建文档记录
+  → 上传 MinIO 与创建文档记录
   → MinerU 解析（Markdown 直接读取）
   → 页面文本恢复与文本切分
   → dense 向量 + sparse 向量
@@ -44,7 +45,13 @@ FastAPI Server :8000
 
 ### 图片处理说明
 
-图片不会直接生成 sparse 向量。MinerU 先为图片或图表生成 `image_caption` / `chart_caption`，项目将这些说明转换为文本；随后 sparse 模型对这段文本生成稀疏向量。因此图片相关的关键词检索依赖图片说明文本。
+MinerU 解析产物中的图片与对应描述按块关联：dense 路将真实图片和该块文本一起传给 `qwen3-vl-embedding`，使用 `enable_fusion=true` 生成一个融合向量；sparse 路只将文本（包括 `image_caption` / `chart_caption`）传给文本嵌入模型，不传图片。纯文本块仍批量生成 dense 和 sparse。
+
+每个含图块单独融合，避免一次请求把多个块合成一个向量。MinerU 图片以 Data URI 发送，保留至嵌入结束后随任务临时目录清理；解析结果引用的图片缺失或路径越界时入库失败，不回退为仅嵌入描述。直接上传的 Markdown 支持内联、引用式与 HTML `<img>` 图片：HTTP(S) URL 或 Base64 Data URI 交给模型服务读取，应用本身不下载图片；sparse 只使用 alt/title 描述。无描述图片使用明确标签，不凭空生成视觉描述。单独上传 `.md` 不包含同目录图片，相对路径会报错，请先将图片转为内嵌 Base64（PNG/JPEG/WEBP/BMP，单张不超过 5 MiB）；不读取服务器本地文件。代码示例里的图片语法不作为真实图片处理。
+
+入库主图按批调用 dense/sparse 并行子图，每批 dense 最多 4 个请求并发；RAG 查询向量化与历史读取并行。流式及非流式回答共用生成与持久化图。详见 [LangGraph 工作流](app/server/services/README.md)。
+
+旧版已入库数据不会自动更新；需要删除对应文档后重新上传，或在独立 Collection 中重建，才能获得图文融合向量。
 
 ## 技术栈
 
@@ -67,6 +74,7 @@ FastAPI Server :8000
 - `uv`
 - 可访问的 MongoDB
 - Zilliz Cloud 或本地 Milvus
+- MinIO
 - MinerU API Key
 - 百炼/DashScope API Key
 
@@ -105,14 +113,12 @@ MINERU_API_KEY=YOUR_MINERU_API_KEY
 ZILLIZ_URI=https://YOUR_CLUSTER_ENDPOINT
 ZILLIZ_TOKEN=YOUR_ZILLIZ_TOKEN
 ZILLIZ_COLLECTION=knowledge_agent_chunks_vl_v1
-```
 
-可选的 Zilliz Managed Volume 配置：
-
-```dotenv
-ZILLIZ_API_KEY=YOUR_CLOUD_API_KEY
-ZILLIZ_VOLUME_NAME=YOUR_VOLUME_NAME
-ZILLIZ_CLOUD_ENDPOINT=https://api.cloud.zilliz.com
+MINIO_ENDPOINT=localhost:9000
+MINIO_ACCESS_KEY=YOUR_MINIO_ACCESS_KEY
+MINIO_SECRET_KEY=YOUR_MINIO_SECRET_KEY
+BUCKET_NAME=knowledge-minio
+# 裸 host:port 默认使用 HTTP；HTTPS 也可直接写入 endpoint，或设置 MINIO_SECURE=true
 ```
 
 常用可选配置：
@@ -121,11 +127,10 @@ ZILLIZ_CLOUD_ENDPOINT=https://api.cloud.zilliz.com
 | --- | --- | --- |
 | `INTERNAL_API_TOKEN` | 空 | FastAPI 内部接口 Bearer Token |
 | `MAX_UPLOAD_SIZE` | `209715200` | 上传大小上限，单位为字节 |
-| `UPLOAD_DIR` | `data/uploads` | 本地原文件目录 |
-| `PROCESSING_DIR` | `data/processing` | 解析产物目录 |
+| `MINIO_SECURE` | 按 endpoint 推断 | 裸 `host:port` 是否使用 TLS |
 | `CHUNK_SIZE` | `1200` | 文本块大小 |
 | `CHUNK_OVERLAP` | `200` | 文本块重叠大小 |
-| `RETRIEVAL_LIMIT` | `20` | 初步召回数量 |
+| `RETRIEVAL_LIMIT` | `30` | 混合检索返回数量；dense 与 sparse 各提供至少 60 个候选给 RRF |
 | `RERANK_LIMIT` | `6` | 重排后送入 LLM 的片段数量 |
 | `WEB_PORT` | `3001` | Express 端口 |
 | `SERVER_BASE_URL` | `http://localhost:8000` | Express 转发的 FastAPI 地址 |
@@ -193,7 +198,7 @@ Zilliz 将两路召回结果通过 RRF 合并，再使用 `qwen3.7-text-rerank` 
 运行 Python 服务测试：
 
 ```bash
-uv run pytest -q test/server
+RUN_FULL_FLOW=0 RUN_MINIO_INTEGRATION=0 uv run pytest -q
 ```
 
 运行 Web 测试：
@@ -203,6 +208,21 @@ npm test
 ```
 
 测试使用内存仓储和模拟 Provider，不会调用 MinerU、百炼或 Zilliz 的付费接口。
+
+无需启动服务即可执行离线全流程：
+
+```bash
+uv run pytest -q tests/test_flows/test_offline_flow.py
+```
+
+显式运行真实 MongoDB、MinIO、MinerU、百炼、Zilliz 和 RAG 全流程：
+
+```bash
+RUN_FULL_FLOW=1 uv run pytest -q -s tests/test_flows/test_real_flow.py
+```
+
+真实流程会调用计费服务并自动清理测试数据，详细选项见
+[`tests/test_flows/README.md`](tests/test_flows/README.md)。
 
 ## 目录结构
 
@@ -218,8 +238,7 @@ KnowledgeAgent/
 │   │   └── services/        入库、检索、RAG 工作流
 │   └── web/                 Express Web 层与前端页面
 ├── README/                  API、架构及专项文档
-├── test/                    Python 与 MinerU 测试
-├── data/                    本地上传文件和解析产物
+├── tests/                    Python 与 MinerU 测试
 ├── pyproject.toml           Python 项目配置
 ├── package.json             Node.js 项目配置
 └── uv.lock                  Python 依赖锁定文件
@@ -232,7 +251,7 @@ KnowledgeAgent/
 - 项目尚未接入正式登录系统，开发模式下所有浏览器请求使用同一个 `DEVELOPMENT_OWNER_ID`。
 - 入库任务由 FastAPI 进程内异步执行，进程重启会中断未完成任务；生产环境建议接入持久化任务队列。
 - 多 worker 部署前，需要将幂等锁、任务状态和会话互斥机制迁移到数据库或分布式锁。
-- Managed Volume 的单个文件不能通过当前 SDK 自动删除，必要时需在 Zilliz 控制台清理。
+- 原文件只持久化到 MinIO；解析所需的临时文件会在任务结束时清理。
 
 ## 更多文档
 

@@ -1,0 +1,2 @@
+# Input fixtures preserve their original line endings and whitespace.
+tests/data/** -whitespace

@@ -70,9 +70,9 @@ button { cursor: pointer; border: 0; }
 .message-content a { color: var(--green); text-decoration: underline; }
 .message.pending .message-content::after { content: ''; display: inline-block; width: 6px; height: 15px; margin-left: 3px; background: var(--green); animation: blink .8s infinite; vertical-align: -2px; }
 @keyframes blink { 50% { opacity: 0; } }
-.citations { display: grid; gap: 7px; margin-top: 14px; }
-.citation { padding: 11px 13px; color: #47534c; background: #f0f4f1; border-left: 3px solid #82a994; border-radius: 6px 10px 10px 6px; font-size: 12px; line-height: 1.55; }
-.citation strong { display: block; margin-bottom: 3px; color: #26352e; }
+.retrieved-images { display: grid; gap: 10px; margin-top: 14px; }
+.retrieved-images:empty { display: none; }
+.retrieved-images img { display: block; max-width: min(100%, 680px); max-height: 520px; border: 1px solid var(--line); border-radius: 10px; object-fit: contain; }
 .composer-wrap { padding: 12px 30px 18px; background: linear-gradient(to top, var(--paper) 70%, transparent); }
 .composer { width: min(850px, 100%); margin: auto; padding: 13px 14px 11px; background: white; border: 1px solid #d8dfda; border-radius: var(--radius); box-shadow: 0 10px 35px rgba(28,47,37,.09); }
 .composer:focus-within { border-color: #91ac9d; box-shadow: 0 10px 38px rgba(28,76,53,.12), 0 0 0 3px rgba(61,118,89,.07); }

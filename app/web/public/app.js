@@ -127,11 +127,26 @@ function addMessage(role, content = '', citations = []) {
   showEmpty(false);
   const node = document.createElement('article');
   node.className = `message ${role}`;
-  node.innerHTML = `<div class="avatar">${role === 'assistant' ? '✦' : '你'}</div><div class="message-body"><div class="message-role">${role === 'assistant' ? 'KnowledgeAgent' : '你'}</div><div class="message-content"></div><div class="citations"></div></div>`;
+  node.innerHTML = `<div class="avatar">${role === 'assistant' ? '✦' : '你'}</div><div class="message-body"><div class="message-role">${role === 'assistant' ? 'KnowledgeAgent' : '你'}</div><div class="message-content"></div><div class="retrieved-images"></div></div>`;
   renderMarkdown(node.querySelector('.message-content'), content);
-  renderCitations(node.querySelector('.citations'), citations);
+  renderRetrievedImages(node.querySelector('.retrieved-images'), citations);
   els.messages.append(node); scrollChat();
   return node;
+}
+
+function renderRetrievedImages(container, citations = []) {
+  container.replaceChildren();
+  const seen = new Set();
+  citations.flatMap((citation) => citation.images || []).forEach((image) => {
+    const key = `${image.document_id}/${image.chunk_index}/${image.image_index}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    const node = document.createElement('img');
+    node.src = `${API}/documents/${encodeURIComponent(image.document_id)}/images/${image.chunk_index}/${image.image_index}`;
+    node.alt = '检索到的文档图片';
+    node.loading = 'lazy';
+    container.append(node);
+  });
 }
 
 // Render the model's Markdown without allowing model output to inject arbitrary HTML.
@@ -170,17 +185,6 @@ function inlineMarkdown(value) {
   }).join('');
 }
 
-function renderCitations(container, citations = []) {
-  container.replaceChildren();
-  citations.forEach((citation, index) => {
-    const node = document.createElement('div'); node.className = 'citation';
-    const title = document.createElement('strong');
-    title.textContent = `[${index + 1}] ${citation.document_name || '来源文档'}${citation.page ? ` · 第 ${citation.page} 页` : ''}`;
-    const text = document.createElement('span'); text.textContent = citation.text || '';
-    node.append(title, text); container.append(node);
-  });
-}
-
 async function sendMessage(text) {
   if (state.streaming) return;
   if (!state.conversationId) {
@@ -202,7 +206,7 @@ async function sendMessage(text) {
     await consumeSSE(response.body, (event, data) => {
       if (event === 'delta') renderMarkdown(content, `${content.dataset.raw || ''}${data.content || ''}`);
       if (event === 'delta') content.dataset.raw = `${content.dataset.raw || ''}${data.content || ''}`;
-      if (event === 'citations') renderCitations(assistant.querySelector('.citations'), data.items);
+      if (event === 'citations') renderRetrievedImages(assistant.querySelector('.retrieved-images'), data.items);
       if (event === 'error') throw new Error(data.message || '回答生成失败');
       scrollChat();
     });

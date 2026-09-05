@@ -22,4 +22,4 @@
 1. MinerU解析PDF到MarkDown
 2. MongoDB存储用户对话记录
 3. chat, embed, rerank <- 对接百炼平台
-4. 向量存储,以及保存原文件 <- 对接zilliz
+4. 向量存储对接 Zilliz，原文件存储对接 MinIO

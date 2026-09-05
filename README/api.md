@@ -32,13 +32,14 @@ sequenceDiagram
     participant Zilliz as Zilliz
     participant Bailian as 百炼
     participant MongoDB as MongoDB
+    participant MinIO as MinIO
 
     Browser->>Express: 上传文档
     Express->>FastAPI: 转发文件并创建入库任务
-    FastAPI->>FastAPI: 原文件保存到本地目录
+    FastAPI->>MinIO: 持久化原文件
     FastAPI-->>Express: 202 queued
     Express-->>Browser: 文档已接收
-    FastAPI->>Zilliz: 可选镜像原文件到 Managed Volume
+    FastAPI->>MinIO: 临时读取原文件用于解析
     FastAPI->>MinerU: 解析 PDF/Word 为 Markdown
     FastAPI->>Bailian: 生成文本向量
     FastAPI->>Zilliz: 写入文本块和向量
@@ -274,7 +275,7 @@ Express 和 FastAPI 都会在响应头返回 `X-Request-Id`，错误响应也包
 
 #### `POST /api/v1/documents`
 
-接收一个文档并创建异步入库任务。接口在原文件完成本地持久化、MongoDB 文档记录创建完成且进程内任务成功登记后返回，不等待 Managed Volume 镜像、MinerU 解析和向量化结束。
+接收一个文档并创建异步入库任务。接口在原文件完成 MinIO 持久化、MongoDB 文档记录创建完成且进程内任务成功登记后返回，不等待 MinerU 解析和向量化结束。
 
 请求头：
 
@@ -319,7 +320,7 @@ cURL 示例：
 ```bash
 curl -X POST 'http://localhost:3001/api/v1/documents' \
   -H 'Idempotency-Key: 91862a89-1cb1-4b43-9498-d5f733e91963' \
-  -F 'file=@./test/data/AttentionIsAllYouNeed.pdf' \
+  -F 'file=@./tests/data/AttentionIsAllYouNeed.pdf' \
   -F 'metadata={"source":"manual-upload","tags":["paper","transformer"]}'
 ```
 
@@ -413,7 +414,7 @@ curl -X POST 'http://localhost:3001/api/v1/documents' \
 
 #### `DELETE /api/v1/documents/{document_id}`
 
-同步删除 MongoDB 文档记录、本地原文件、解析产物和对应的 Zilliz 向量。处理过程中内部状态为 `deleting`，所有清理成功后返回 204；失败时文档进入 `failed` 并返回错误。Managed Volume 中的单个文件不会自动删除，见第 6.4 节。
+同步删除 MongoDB 文档记录、MinIO 原文件和对应的 Zilliz 向量。处理过程中内部状态为 `deleting`，所有清理成功后返回 204；失败时文档进入 `failed` 并返回错误。
 
 响应：`204 No Content`
 
@@ -582,7 +583,7 @@ Express 转发资源查询、删除和 multipart 上传时，应设置 `X-Owner-
 
 #### `GET /internal/v1/health/ready`
 
-检查 FastAPI、MongoDB 和 Zilliz 的基本连通性。现有实现不调用 MinerU、百炼等按次计费服务，响应中将其标记为 `not_checked`。
+检查 FastAPI、MongoDB、MinIO 和 Zilliz 的基本连通性。该检查不调用 MinerU、百炼等按次计费服务，响应中将其标记为 `not_checked`。
 
 响应：`200 OK`
 
@@ -591,6 +592,7 @@ Express 转发资源查询、删除和 multipart 上传时，应设置 `X-Owner-
   "status": "ready",
   "dependencies": {
     "mongodb": "up",
+    "minio": "up",
     "zilliz": "up",
     "bailian": "not_checked",
     "mineru": "not_checked"
@@ -617,11 +619,11 @@ Express 将浏览器上传的 multipart 请求转发至该接口。字段与 Web
 处理步骤：
 
 1. 校验文件并生成 `document_id`。
-2. 将原文件保存到本地 `UPLOAD_DIR`，创建 MongoDB 文档记录并启动进程内异步任务。
-3. 若 Managed Volume 配置完整，将本地原文件镜像到 Zilliz Volume。
-4. PDF/Word 通过 MinerU 转为 Markdown；Markdown 直接进入下一步。
-5. 使用统一的 text splitter 生成文本块，并尽可能保留页码、标题层级、列表、表格和图表说明。
-6. 每批最多 20 条，使用 `qwen3-vl-embedding` 生成 dense 向量，使用 `qwen3.7-text-embedding` 生成 sparse 向量。
+2. 将原文件写入 MinIO，创建 MongoDB 文档记录并启动进程内异步任务。
+3. 从 MinIO 下载到任务专用临时目录；PDF/Word 通过 MinerU 转为 Markdown，Markdown 直接进入下一步。
+4. 文档处理完成或失败后立即清理全部本地临时文件。
+5. 使用 text splitter 切分正文及图表描述，保留页码、标题层级，并将含图块与 MinerU 的 `img_path` 关联。无 content-list 时从 MinerU Markdown 内联图片恢复关联，页码为空。
+6. 每批最多 20 条：纯文本批量生成 dense；含图块分别将真实图片和对应文本传入 `qwen3-vl-embedding`，以 `enable_fusion=true` 生成一个 dense 向量。`qwen3.7-text-embedding` 只接收正文及图片描述文本生成 sparse，不接收图片。禁止将多个 chunk 放在一次融合请求中。
 7. 将文本块、向量和文档元数据写入 Zilliz Collection。
 8. 更新状态为 `indexed`；任一步骤失败则更新为 `failed` 并保存可诊断的错误信息。
 
@@ -640,13 +642,13 @@ Express 将浏览器上传的 multipart 请求转发至该接口。字段与 Web
 
 #### `GET /internal/v1/documents/{document_id}`
 
-返回内部 Document 数据。FastAPI 已按 `X-Owner-Id` 校验资源归属。内部响应可能包含 `owner_id`、`storage_path`、`volume_path`、`sha256` 和 `idempotency_key` 等字段；Express 返回浏览器前会过滤这些内部字段。
+返回内部 Document 数据。FastAPI 已按 `X-Owner-Id` 校验资源归属。内部存储记录中的 `storage_path` 是 MinIO 对象键，并可能包含 `owner_id`、`sha256` 和 `idempotency_key` 等内部字段；Express 返回浏览器前会过滤这些内部字段。
 
 ### 6.4 删除文档
 
 #### `DELETE /internal/v1/documents/{document_id}`
 
-删除 Zilliz 中该文档的所有文本块和向量、本地原文件及文档元数据。若启用 Managed Volume，Zilliz 官方 SDK 只能删除整个 Volume，单个文件或目录只能在控制台删除；服务端不得为删除一个文档而调用 `delete_volume()`。若业务要求自动清理远端原文件，应改用支持对象级删除的外部 Volume，或增加独立的存储服务。向量删除应以 `document_id` 作为过滤条件，避免仅按文件名删除。
+删除 Zilliz 中该文档的所有文本块和向量、MinIO 原文件及文档元数据。MinIO 按对象键执行单文件删除；向量删除以 `document_id` 作为过滤条件，避免仅按文件名删除。
 
 ### 6.5 RAG 查询
 
@@ -675,6 +677,8 @@ Express 将浏览器上传的 multipart 请求转发至该接口。字段与 Web
 | `stream` | boolean | 否 | 是否流式返回，默认 `true` |
 
 已实现的 RAG 流程：
+
+以下流程由 LangGraph 准备图与回答图执行。准备图在写入 user 后并行查询 dense、sparse 和最近历史；回答图由流式/非流式共用，缓存命中时跳过生成与写入。对外 API 和 SSE 协议保持不变。
 
 1. 校验会话和文档均属于 `owner_id`。
 2. 将用户消息写入 MongoDB。
@@ -756,7 +760,9 @@ MongoDB 使用以下集合：
 
 向量维度必须与实际模型配置保持一致。服务端使用双模型生成混合检索向量：`dense_vector` 来自 `qwen3-vl-embedding`，`sparse_vector` 来自 `qwen3.7-text-embedding`。文档入库和查询必须使用相同的模型组合，不能把不同模型生成的 dense 向量写入或查询同一个字段。
 
-原文件镜像到 Zilliz Volume 时使用经过路径片段校验的对象路径：
+含图块的 dense 是文本与真实图片的融合向量，sparse 仍来自文本描述。MinerU 图片仅在任务临时目录中使用；图片缺失或路径越界时任务进入 `failed`。直接上传 Markdown 支持内联、引用式和 HTML `<img>` 的 HTTP(S) URL / Base64 图片，由模型服务读取，不增加接口字段。应用不下载远程图片，也不读取服务器本地图片；单独上传的相对路径图片须先内嵌，否则入库失败。内嵌图片限 PNG/JPEG/WEBP/BMP、单张 5 MiB，并受原上传大小限制。描述依次使用 alt、title、无描述标签，不将图片 URL/Base64 写入 sparse 文本。旧版向量需重新入库更新，不会自动迁移。
+
+原文件写入 MinIO 时使用经过路径片段校验的对象键：
 
 ```text
 documents/{owner_id}/{document_id}/source.pdf
@@ -791,14 +797,15 @@ documents/{owner_id}/{document_id}/source.pdf
 | `ZILLIZ_URI` | Zilliz/Milvus Endpoint |
 | `ZILLIZ_TOKEN` | Zilliz 数据库令牌 |
 | `ZILLIZ_COLLECTION` | 文本块 Collection 名称，默认 `knowledge_agent_chunks_vl_v1`；更换 dense 模型时应使用新 Collection 或全量重建 |
-| `ZILLIZ_API_KEY` | Zilliz Cloud Volume API 密钥 |
-| `ZILLIZ_VOLUME_NAME` | 原文件 Volume 名称 |
+| `MINIO_ENDPOINT` | MinIO 地址，可为 `host:port` 或 HTTP(S) URL |
+| `MINIO_ACCESS_KEY` | MinIO Access Key |
+| `MINIO_SECRET_KEY` | MinIO Secret Key |
+| `BUCKET_NAME` | 原文件 Bucket 名；代码会规范化为小写 |
+| `MINIO_SECURE` | 裸 `host:port` 是否启用 TLS；省略时为 HTTP |
 | `MAX_UPLOAD_SIZE` | 单文件上传上限 |
-| `UPLOAD_DIR` | 本地原文件目录，默认 `data/uploads` |
-| `PROCESSING_DIR` | MinerU 处理结果目录，默认 `data/processing` |
 | `CHUNK_SIZE` | chunk 字符数，默认 `1200` |
 | `CHUNK_OVERLAP` | chunk 重叠字符数，默认 `200` |
-| `RETRIEVAL_LIMIT` | 混合检索返回数，默认 `20` |
+| `RETRIEVAL_LIMIT` | 混合检索返回数，默认 `30`；dense 与 sparse 各提供至少 60 个候选给 RRF |
 | `RERANK_LIMIT` | Rerank 返回数，默认 `6` |
 
 所有密钥只保存在服务端环境变量或密钥管理服务中，不应提交到 Git、写入前端代码或通过 API 响应返回。
@@ -813,7 +820,8 @@ documents/{owner_id}/{document_id}/source.pdf
 - PDF 和 Markdown 可观察到完整状态流转并达到 `indexed`；Word 使用与 PDF 相同的 MinerU 路由，已有 Provider 级测试，但本轮未重新上传 Word。
 - 指定 `document_ids` 的检索范围、owner 数据隔离和上传/问答幂等已有自动化测试。
 - SSE 已验证中文、多段 `delta`、引用和正常结束；流内错误协议已实现，仍需补充专门的自动化用例。
-- 删除文档后，MongoDB 元数据、本地原文件、MinerU 解析产物和 Zilliz 向量可以清理；Managed Volume 单文件除外。
+- 删除文档后，MongoDB 元数据、MinIO 原文件和 Zilliz 向量均会清理；MinerU 和源文件的本地临时副本在每次任务结束时清理。
+- MinIO 迁移后已用真实 MongoDB、百炼、Zilliz 和本地 MinIO 完成 Markdown 上传、入库、RAG 与删除的端到端验证。
 - 2026-09-05 经 Express Web API 完成真实 PDF 端到端联调：64 个 chunks、两次 RAG 回答、4 条持久化消息，随后完成临时数据清理。
 
 ### 9.2 上线前待完成

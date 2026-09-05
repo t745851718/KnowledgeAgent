@@ -10,7 +10,7 @@ langgraph + llm(deepseek-v4-flash) + embed(多模态: qwen3-vl-embedding) + rera
 
 2. 解析文档   
 - 接收Word, PDF, md文档, 动态路由，配置不同类型文件不同处理，目前Word，PDF都用MinerU解析为md, 然后md用text_split统一处理
-- 由embed转为向量存入zilliz, 原文件写入zilliz-volume
+- 由 embed 转为向量存入 Zilliz，原文件写入 MinIO
 
 ## utils
 - MongoDB存储用户对话记录

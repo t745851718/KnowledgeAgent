@@ -21,7 +21,7 @@ app/server/
 
 依赖方向为 `api → services → repositories/providers`；`domain` 和 `core` 提供共享的数据结构与配置。启动入口为 `app.server.main:app`。
 
-虽然项目依赖中包含 LangGraph，但现有 RAG 链路由 `RagService` 直接编排，尚未构建 LangGraph graph。
+入库与 RAG 使用 LangGraph `StateGraph`，在 service 初始化时编译并复用。`services/ingestion.py` 实现入库主图与双路嵌入子图，`services/rag.py` 实现检索准备图和流式/非流式共用的回答图；`workflows.py` 仅保留导入兼容。图结构及修改原则见 [工作流说明](services/README.md)。
 
 ## 已实现接口
 
@@ -73,14 +73,11 @@ MINERU_API_KEY=YOUR_API_KEY
 ZILLIZ_URI=https://YOUR_CLUSTER_ENDPOINT
 ZILLIZ_TOKEN=YOUR_TOKEN
 ZILLIZ_COLLECTION=knowledge_agent_chunks_vl_v1
-```
 
-若需要把原文件同步到 Zilliz Volume，再配置：
-
-```dotenv
-ZILLIZ_API_KEY=YOUR_CLOUD_API_KEY
-ZILLIZ_VOLUME_NAME=YOUR_VOLUME_NAME
-ZILLIZ_CLOUD_ENDPOINT=https://api.cloud.zilliz.com
+MINIO_ENDPOINT=localhost:9000
+MINIO_ACCESS_KEY=YOUR_MINIO_ACCESS_KEY
+MINIO_SECRET_KEY=YOUR_MINIO_SECRET_KEY
+BUCKET_NAME=knowledge-minio
 ```
 
 可选配置：
@@ -89,11 +86,10 @@ ZILLIZ_CLOUD_ENDPOINT=https://api.cloud.zilliz.com
 | --- | --- | --- |
 | `INTERNAL_API_TOKEN` | 空 | 配置后，所有 `/internal/v1` 请求必须携带 Bearer Token |
 | `MAX_UPLOAD_SIZE` | `209715200` | 上传大小上限，单位为字节 |
-| `UPLOAD_DIR` | `data/uploads` | 原文件本地持久化目录 |
-| `PROCESSING_DIR` | `data/processing` | MinerU 解析结果目录 |
+| `MINIO_SECURE` | 按 endpoint 推断 | 裸 `host:port` 是否使用 TLS |
 | `CHUNK_SIZE` | `1200` | 文本块字符数 |
 | `CHUNK_OVERLAP` | `200` | 相邻文本块重叠字符数 |
-| `RETRIEVAL_LIMIT` | `20` | Zilliz 初步召回数量 |
+| `RETRIEVAL_LIMIT` | `30` | 混合检索返回数量；dense 与 sparse 各提供至少 60 个候选给 RRF |
 | `RERANK_LIMIT` | `6` | 重排后提供给模型的片段数 |
 | `MINERU_API_BASE` | `https://mineru.net/api/v4` | MinerU API 地址 |
 | `MINERU_MODEL` | `vlm` | MinerU 解析模型 |
@@ -107,12 +103,12 @@ ZILLIZ_CLOUD_ENDPOINT=https://api.cloud.zilliz.com
 
 ## 文档入库流程
 
-上传接口在本地原文件保存成功、MongoDB 文档记录创建完成且进程内任务已登记后返回 HTTP 202。后续处理顺序为：
+上传接口在 MinIO 原文件保存成功、MongoDB 文档记录创建完成且进程内任务已登记后返回 HTTP 202。后续处理顺序为：
 
-1. 如已配置 Zilliz Managed Volume，将本地原文件镜像到 `documents/{owner_id}/{document_id}/`。
-2. PDF、DOC、DOCX 调用 MinerU；Markdown 直接读取。
-3. 优先从 MinerU content-list 恢复页码、标题、列表、表格和图表说明，再进行 Markdown 切分。
-4. 每批最多 20 个 chunk，并行生成 dense 和 sparse 向量。
+1. 从 MinIO 对象 `documents/{owner_id}/{document_id}/source.<ext>` 下载到任务专用临时目录。
+2. PDF、DOC、DOCX 调用 MinerU；Markdown 直接读取；任务结束后清理临时目录。
+3. 优先从 MinerU content-list 恢复页码、标题、列表、表格、图表说明及 `img_path`。连续正文按文本切分，含图块携带自己的图片路径与描述；无 content-list 时从 MinerU Markdown 的内联图片引用恢复关联（页码为空）。
+4. 每批最多 20 个 chunk，由 LangGraph 子图并行处理 dense 和 sparse 两路，并在两路完成后写入。dense 每批最多并发 4 个请求；纯文本合批，含图块独立开启 `enable_fusion=true`。sparse 批量输入正文或图片描述文本。
 5. 将 chunk 写入 Zilliz，持续更新 `stage` 和 `progress`，成功后进入 `indexed/completed`。
 
 HTTP 202 仅表示任务已接受，客户端必须轮询文档详情，直到状态进入 `indexed` 或 `failed`。
@@ -121,8 +117,10 @@ HTTP 202 仅表示任务已接受，客户端必须轮询文档详情，直到�
 
 每个文本块会并行生成两种向量：
 
-- `dense_vector`：由 `qwen3-vl-embedding` 生成，用于语义召回。
-- `sparse_vector`：由 `qwen3.7-text-embedding` 生成，用于关键词召回。
+- `dense_vector`：由 `qwen3-vl-embedding` 生成；含图块使用真实图片和对应文本融合，纯文本块只输入文本。
+- `sparse_vector`：由 `qwen3.7-text-embedding` 生成，只输入文本，图片使用解析描述。
+
+MinerU 图片路径仅限解析目录内的真实文件，越界或缺失时入库失败，Provider 将其编码为 Data URI。直接上传 Markdown 使用 `utils/markdown_chunks.py` 解析内联、引用式与 HTML `<img>` 图片，将 HTTP(S) URL 或 Base64 交给模型服务，不在应用中下载。相对路径图片未随 `.md` 上传，必须先内嵌，否则明确失败；不读取服务器文件。图片描述取 alt、title 或无描述标签，不能凭空补出 sparse 视觉语义。图片输入不持久化到 Zilliz。已有文档需要重新入库才能更新图文融合向量。
 
 Zilliz 使用 RRF 合并两路结果，然后通过 `qwen3.7-text-rerank` 重排。查询采用同一模型组合。
 
@@ -133,16 +131,19 @@ RAG 查询会校验会话和指定文档均属于请求 owner，将用户消息�
 ## 测试
 
 ```bash
-UV_CACHE_DIR=/private/tmp/knowledgeagent-uv-cache uv run pytest -q test/server
+RUN_FULL_FLOW=0 RUN_MINIO_INTEGRATION=0 UV_CACHE_DIR=/private/tmp/knowledgeagent-uv-cache uv run pytest -q
 ```
 
 测试使用内存仓储和假的外部 Provider，不会产生 MinerU、百炼或 Zilliz 调用费用。
+
+不启动服务的离线及真实全流程测试见
+[`tests/test_flows/README.md`](../../tests/test_flows/README.md)。
 
 Web 代理和真实外部依赖联调方式见 [`app/web/README.md`](../web/README.md)。
 
 ### 2026-09-05 真实联调记录
 
-通过 Express `/api/v1` 上传 2,215,244 字节的 `AttentionIsAllYouNeed.pdf`，真实调用 MongoDB Atlas、Zilliz Cloud、Zilliz Managed Volume、MinerU 和百炼：
+以下是迁移 MinIO 之前的历史记录：通过 Express `/api/v1` 上传 2,215,244 字节的 `AttentionIsAllYouNeed.pdf`，真实调用 MongoDB Atlas、Zilliz Cloud、Zilliz Managed Volume、MinerU 和百炼：
 
 - 文档约 50 秒进入 `indexed/completed`，写入 64 个 chunks；Zilliz 查询确认 64 条记录。
 - 非流式问答返回 6 条带页码引用，usage 为 1376 tokens。
@@ -150,11 +151,14 @@ Web 代理和真实外部依赖联调方式见 [`app/web/README.md`](../web/READ
 - MongoDB 中确认保存两条 user 消息和两条 assistant 消息。
 - 删除 API 返回 204；MongoDB 文档、Zilliz 64 条向量、本地原文件和 MinerU 处理目录均已清理，会话及其消息也已删除。
 
-本次联调创建的临时 MongoDB、Collection 数据和本地文件已清理。Managed Volume 中的单个测试文件无法通过 SDK 删除，需在 Zilliz 控制台清理。
+该次联调创建的临时 MongoDB、Collection 数据和本地文件已清理。迁移后的原文件改由 MinIO 管理。
+
+MinIO 迁移后又完成了一轮 Markdown 真实端到端验证：HTTP 上传、MinIO 持久化、百炼向量化、Zilliz 入库、RAG 回答、MinIO 对象删除及 MongoDB/Zilliz 测试数据清理均成功。
 
 ## 运行限制
 
 - 入库任务由进程内异步任务执行。进程异常退出时无法恢复任务，生产部署需要替换为持久化任务队列。
+- LangGraph 不启用 checkpointer 或节点自动重试；引入恢复/重试前需先设计外部写入幂等。同步 SDK 调用取消时会等待已开始的调用结束，关闭耗时受其超时配置影响。
 - 入库幂等锁、RAG `request_id` 锁和 Zilliz 文档锁都包含单进程机制；多 worker 部署需要数据库级幂等记录、租约和会话互斥。
 - 文档、会话和消息列表目前先读取记录后在 Python 中按 ID 游标分页，不适合超大数据量。
-- `VolumeFileManager` 只提供上传能力。官方 SDK 的 `VolumeManager.delete_volume()` 会删除整个 Volume 及其中全部文件，不能用于删除单个文档；Managed Volume 内单个文件或目录只能在 Zilliz 控制台删除。文档 API 因此只自动清理本地原文件和 Collection 向量。
+- 原文件只持久化在 MinIO。解析阶段会使用系统临时目录，正常完成、失败或任务取消都会清理。

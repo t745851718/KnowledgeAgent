@@ -77,6 +77,13 @@ class Citation(BaseModel):
     page: int | None = None
     score: float
     text: str
+    images: list["RetrievedImage"] = Field(default_factory=list)
+
+
+class RetrievedImage(BaseModel):
+    document_id: str
+    chunk_index: int = Field(ge=0)
+    image_index: int = Field(ge=0)
 
 
 class Usage(BaseModel):

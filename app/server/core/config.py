@@ -71,15 +71,15 @@ class Settings:
     zilliz_uri: str | None = None
     zilliz_token: str | None = None
     zilliz_collection: str = "knowledge_agent_chunks_vl_v1"
-    zilliz_api_key: str | None = None
-    zilliz_volume_name: str | None = None
-    zilliz_cloud_endpoint: str = "https://api.cloud.zilliz.com"
-    upload_dir: Path = PROJECT_ROOT / "data/uploads"
-    processing_dir: Path = PROJECT_ROOT / "data/processing"
+    minio_endpoint: str | None = None
+    minio_access_key: str | None = None
+    minio_secret_key: str | None = None
+    minio_bucket_name: str | None = None
+    minio_secure: bool | None = None
     max_upload_size: int = 200 * 1024 * 1024
     chunk_size: int = 1200
     chunk_overlap: int = 200
-    retrieval_limit: int = 20
+    retrieval_limit: int = 30
     rerank_limit: int = 6
     probe_paid_dependencies: bool = False
 
@@ -110,20 +110,19 @@ class Settings:
             zilliz_token=_optional("ZILLIZ_TOKEN"),
             zilliz_collection=_optional("ZILLIZ_COLLECTION")
             or "knowledge_agent_chunks_vl_v1",
-            zilliz_api_key=_optional("ZILLIZ_API_KEY"),
-            zilliz_volume_name=_optional("ZILLIZ_VOLUME_NAME"),
-            zilliz_cloud_endpoint=_optional("ZILLIZ_CLOUD_ENDPOINT")
-            or "https://api.cloud.zilliz.com",
-            upload_dir=Path(
-                _optional("UPLOAD_DIR") or PROJECT_ROOT / "data/uploads"
-            ).resolve(),
-            processing_dir=Path(
-                _optional("PROCESSING_DIR") or PROJECT_ROOT / "data/processing"
-            ).resolve(),
+            minio_endpoint=_optional("MINIO_ENDPOINT"),
+            minio_access_key=_optional("MINIO_ACCESS_KEY"),
+            minio_secret_key=_optional("MINIO_SECRET_KEY"),
+            minio_bucket_name=_optional("BUCKET_NAME"),
+            minio_secure=(
+                _boolean("MINIO_SECURE", True)
+                if _optional("MINIO_SECURE") is not None
+                else None
+            ),
             max_upload_size=_integer("MAX_UPLOAD_SIZE", 200 * 1024 * 1024),
             chunk_size=_integer("CHUNK_SIZE", 1200),
             chunk_overlap=_integer("CHUNK_OVERLAP", 200),
-            retrieval_limit=_integer("RETRIEVAL_LIMIT", 20),
+            retrieval_limit=_integer("RETRIEVAL_LIMIT", 30),
             rerank_limit=_integer("RERANK_LIMIT", 6),
             probe_paid_dependencies=_boolean("PROBE_PAID_DEPENDENCIES", False),
         )

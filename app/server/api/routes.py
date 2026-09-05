@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Annotated, Any
 
@@ -146,6 +147,20 @@ async def get_document(
     return await _container(request).ingestion.get(
         document_id, owner_id=_owner_id(owner_header, owner_id)
     )
+
+
+@router.get("/documents/{document_id}/images/{chunk_index}/{image_index}", tags=["documents"])
+async def get_document_image(
+    document_id: str, chunk_index: int, image_index: int, request: Request,
+    owner_header: Annotated[str | None, Header(alias="X-Owner-Id")] = None,
+) -> Response:
+    document = await _container(request).ingestion.get(document_id, owner_id=_owner_id(owner_header))
+    image_keys = document.get("image_keys") or {}
+    keys = image_keys.get(str(chunk_index), image_keys.get(chunk_index, []))
+    if image_index >= len(keys):
+        raise AppError(404, "IMAGE_NOT_FOUND", "图片不存在")
+    data, content_type = await asyncio.to_thread(_container(request).storage.read_image, keys[image_index])
+    return Response(content=data, media_type=content_type, headers={"Cache-Control": "private, max-age=3600"})
 
 
 @router.delete(

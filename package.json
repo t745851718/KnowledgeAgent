@@ -4,7 +4,7 @@
   "description": "",
   "main": "app/web/server.js",
   "directories": {
-    "test": "test"
+    "test": "tests"
   },
   "scripts": {
     "start": "node app/web/server.js",

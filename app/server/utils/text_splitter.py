@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
 
 _HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
@@ -15,6 +16,7 @@ class TextChunk:
     chunk_index: int
     section: str | None = None
     page: int | None = None
+    image_paths: tuple[Path | str, ...] = ()
 
 
 def _split_windows(text: str, chunk_size: int, overlap: int) -> list[str]:

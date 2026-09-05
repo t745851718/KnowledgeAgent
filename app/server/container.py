@@ -9,7 +9,7 @@ from typing import Any
 from .core import Settings
 from .providers.bailian import BailianProvider
 from .providers.mineru import MinerUProvider
-from .providers.storage import LocalFileStorage
+from .providers.storage import MinioStorage
 from .providers.zilliz import ZillizProvider
 from .repositories import MemoryRepository, MongoRepository, Repository
 from .services import HealthService, IngestionService, RagService, TaskSupervisor
@@ -29,8 +29,9 @@ class Container:
     health: HealthService
 
     async def initialize(self) -> None:
-        self.settings.upload_dir.mkdir(parents=True, exist_ok=True)
-        self.settings.processing_dir.mkdir(parents=True, exist_ok=True)
+        initialize_storage = getattr(self.storage, "initialize", None)
+        if callable(initialize_storage):
+            await asyncio.to_thread(initialize_storage)
         await self.repository.initialize()
 
     async def close(self) -> None:
@@ -52,16 +53,16 @@ def build_container(settings: Settings) -> Container:
         repository = MemoryRepository()
         using_memory_repository = True
 
-    storage = LocalFileStorage(
-        root=settings.upload_dir,
-        volume_cloud_endpoint=settings.zilliz_cloud_endpoint,
-        volume_api_key=settings.zilliz_api_key,
-        volume_name=settings.zilliz_volume_name,
+    storage = MinioStorage(
+        endpoint=settings.minio_endpoint,
+        access_key=settings.minio_access_key,
+        secret_key=settings.minio_secret_key,
+        bucket_name=settings.minio_bucket_name,
+        secure=settings.minio_secure,
     )
     mineru = MinerUProvider(
         api_key=settings.mineru_api_key,
         api_base_url=settings.mineru_api_base,
-        output_root=settings.processing_dir,
         model_version=settings.mineru_model,
         poll_interval=settings.mineru_poll_interval,
         max_wait=settings.mineru_max_wait,
@@ -100,6 +101,7 @@ def build_container(settings: Settings) -> Container:
     )
     health = HealthService(
         repository=repository,
+        storage=storage,
         zilliz=zilliz,
         settings=settings,
         using_memory_repository=using_memory_repository,

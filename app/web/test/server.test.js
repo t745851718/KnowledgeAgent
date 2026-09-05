@@ -2,6 +2,8 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const { createApp, mapInternalPath } = require('../server');
 
 test('maps public API paths to their internal counterparts', () => {
@@ -63,4 +65,14 @@ test('filters internal fields from public document responses', async (t) => {
   const response = await fetch(`http://127.0.0.1:${server.address().port}/api/v1/documents`);
   const payload = await response.json();
   assert.deepEqual(payload.data.items, [{ id:'doc_1', name:'guide.md' }]);
+});
+
+test('does not render retrieved source chunks in chat messages', () => {
+  const script = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
+  const page = fs.readFileSync(path.join(__dirname, '../public/index.html'), 'utf8');
+  const styles = fs.readFileSync(path.join(__dirname, '../public/styles.css'), 'utf8');
+
+  assert.doesNotMatch(script, /renderCitations|querySelector\('\.citations'\)/);
+  assert.doesNotMatch(page, /核对原文引用/);
+  assert.doesNotMatch(styles, /\.citations|\.citation/);
 });

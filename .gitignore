@@ -21,3 +21,7 @@ venv/
 
 # node
 node_modules
+
+# Local test outputs (keep inputs and test sources in Git)
+.pytest_cache/
+tests/**/output/

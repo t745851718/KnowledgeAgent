@@ -1,14 +1,18 @@
-"""Durable local source-file storage with optional Zilliz Volume mirroring."""
+"""MinIO-backed source document storage."""
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
-import os
-import shutil
+import mimetypes
+import re
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any
+from urllib.parse import urlsplit
 
-from pymilvus.bulk_writer.volume_file_manager import VolumeFileManager
+from minio import Minio
+from minio.deleteobjects import DeleteObject
+from minio.error import S3Error
 
 from . import ProviderError
 
@@ -19,166 +23,227 @@ def _safe_segment(value: str, name: str) -> str:
     return value
 
 
-class LocalFileStorage:
-    """Store uploads under ``<root>/<document_id>/source.<extension>``."""
+def _endpoint(value: str, secure: bool | None) -> tuple[str, bool]:
+    endpoint = value.strip().rstrip("/")
+    if "://" not in endpoint:
+        return endpoint, False if secure is None else secure
+    parsed = urlsplit(endpoint)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("MINIO_ENDPOINT 必须是 host:port 或有效的 HTTP(S) URL")
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise ValueError("MINIO_ENDPOINT 不能包含路径、查询参数或 fragment")
+    return parsed.netloc, parsed.scheme == "https"
 
-    _COPY_CHUNK_SIZE = 1024 * 1024
+
+class MinioStorage:
+    """Store each source as ``documents/<owner>/<document>/source.<ext>``."""
+
+    _CHUNK_SIZE = 1024 * 1024
 
     def __init__(
         self,
         *,
-        root: str | Path | None = None,
-        volume_cloud_endpoint: str | None = None,
-        volume_api_key: str | None = None,
-        volume_name: str | None = None,
+        endpoint: str | None,
+        access_key: str | None,
+        secret_key: str | None,
+        bucket_name: str | None,
+        secure: bool | None = None,
+        client: Any | None = None,
     ) -> None:
-        self.root = Path(root or os.getenv("FILE_STORAGE_ROOT") or ".data/files").resolve()
-        self.volume_cloud_endpoint = volume_cloud_endpoint or os.getenv("ZILLIZ_CLOUD_ENDPOINT")
-        self.volume_api_key = volume_api_key or os.getenv("ZILLIZ_API_KEY")
-        self.volume_name = volume_name or os.getenv("ZILLIZ_VOLUME_NAME")
+        self.bucket_name = (bucket_name or "").strip().lower()
+        if self.bucket_name and not re.fullmatch(
+            r"(?=.{3,63}$)[a-z0-9][a-z0-9.-]*[a-z0-9]", self.bucket_name
+        ):
+            raise ProviderError("storage", "BUCKET_NAME 不是有效的 S3 Bucket 名称")
+        self._configuration_error: str | None = None
+        if client is not None:
+            self.client = client
+            return
+        if not endpoint or not access_key or not secret_key or not self.bucket_name:
+            self.client = None
+            self._configuration_error = (
+                "缺少 MINIO_ENDPOINT、MINIO_ACCESS_KEY、MINIO_SECRET_KEY 或 BUCKET_NAME"
+            )
+            return
+        try:
+            normalized_endpoint, use_tls = _endpoint(endpoint, secure)
+            self.client = Minio(
+                normalized_endpoint,
+                access_key=access_key,
+                secret_key=secret_key,
+                secure=use_tls,
+            )
+        except Exception as exc:
+            raise ProviderError("storage", f"MinIO 配置无效: {exc}") from exc
 
-    @property
-    def volume_enabled(self) -> bool:
-        return bool(self.volume_cloud_endpoint and self.volume_api_key and self.volume_name)
+    def _require_client(self) -> Any:
+        if self.client is None:
+            raise ProviderError("storage", self._configuration_error or "MinIO 未配置")
+        return self.client
 
-    def _destination(self, document_id: str, extension: str) -> Path:
+    def initialize(self) -> None:
+        client = self._require_client()
+        try:
+            if not client.bucket_exists(self.bucket_name):
+                client.make_bucket(self.bucket_name)
+        except Exception as exc:
+            raise ProviderError(
+                "storage", f"初始化 MinIO Bucket 失败: {exc}", retryable=True
+            ) from exc
+
+    def ping(self) -> bool:
+        try:
+            return bool(self._require_client().bucket_exists(self.bucket_name))
+        except Exception:
+            return False
+
+    @staticmethod
+    def object_name(*, owner_id: str, document_id: str, extension: str) -> str:
+        owner = _safe_segment(owner_id, "owner_id")
         document = _safe_segment(document_id, "document_id")
         normalized_extension = extension.lower().lstrip(".")
         if not normalized_extension or not normalized_extension.isalnum():
             raise ValueError("文件扩展名不合法")
-        target = (self.root / document / f"source.{normalized_extension}").resolve()
-        if not target.is_relative_to(self.root):
-            raise ValueError("文件路径超出存储根目录")
-        return target
+        return f"documents/{owner}/{document}/source.{normalized_extension}"
 
-    def _checked_path(self, path: str | Path) -> Path:
-        target = Path(path).resolve()
-        if not target.is_relative_to(self.root):
-            raise ValueError("文件路径超出存储根目录")
-        return target
-
-    def save_file(
-        self,
-        source: BinaryIO | str | Path,
-        *,
-        document_id: str,
-        extension: str,
-        max_size: int | None = None,
-    ) -> tuple[Path, int, str]:
-        """Synchronously copy a file, returning ``(path, size, sha256)``."""
-
-        destination = self._destination(document_id, extension)
-        size = 0
-        digest = hashlib.sha256()
-        try:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            should_close = isinstance(source, (str, Path))
-            input_file: BinaryIO = Path(source).open("rb") if should_close else source
-            try:
-                try:
-                    input_file.seek(0)
-                except (AttributeError, OSError):
-                    pass
-                with destination.open("wb") as output_file:
-                    while data := input_file.read(self._COPY_CHUNK_SIZE):
-                        size += len(data)
-                        if max_size is not None and size > max_size:
-                            raise ProviderError("storage", f"文件超过大小限制 {max_size} 字节", code="FILE_TOO_LARGE")
-                        digest.update(data)
-                        output_file.write(data)
-            finally:
-                if should_close:
-                    input_file.close()
-            return destination, size, digest.hexdigest()
-        except Exception as exc:
-            destination.unlink(missing_ok=True)
-            if isinstance(exc, ProviderError):
-                raise
-            raise ProviderError("storage", f"保存原文件失败: {exc}") from exc
+    @staticmethod
+    def _validate_object_name(object_name: str) -> str:
+        path = Path(object_name)
+        if (
+            path.is_absolute()
+            or ".." in path.parts
+            or not object_name.startswith("documents/")
+        ):
+            raise ValueError("MinIO 对象键不合法")
+        return object_name
 
     async def save_upload(
         self,
         upload: Any,
         *,
+        owner_id: str,
         document_id: str,
         extension: str,
+        content_type: str,
         max_size: int,
-    ) -> tuple[Path, int, str]:
-        """Stream a FastAPI ``UploadFile``-like object to local storage."""
+    ) -> tuple[str, int, str]:
+        """Hash the request stream, then upload it without a persistent local copy."""
 
-        destination = self._destination(document_id, extension)
+        object_name = self.object_name(
+            owner_id=owner_id, document_id=document_id, extension=extension
+        )
         size = 0
         digest = hashlib.sha256()
         try:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            seek = getattr(upload, "seek", None)
-            if callable(seek):
-                result = seek(0)
-                if hasattr(result, "__await__"):
-                    await result
-            with destination.open("wb") as output_file:
-                while True:
-                    data = upload.read(self._COPY_CHUNK_SIZE)
-                    if hasattr(data, "__await__"):
-                        data = await data
-                    if not data:
-                        break
-                    size += len(data)
-                    if size > max_size:
-                        raise ProviderError("storage", f"文件超过大小限制 {max_size} 字节", code="FILE_TOO_LARGE")
-                    digest.update(data)
-                    output_file.write(data)
-            return destination, size, digest.hexdigest()
+            await upload.seek(0)
+            while True:
+                data = await upload.read(self._CHUNK_SIZE)
+                if not data:
+                    break
+                size += len(data)
+                if size > max_size:
+                    raise ProviderError(
+                        "storage",
+                        f"文件超过大小限制 {max_size} 字节",
+                        code="FILE_TOO_LARGE",
+                    )
+                digest.update(data)
+            await upload.seek(0)
+            await asyncio.to_thread(
+                self._require_client().put_object,
+                self.bucket_name,
+                object_name,
+                upload.file,
+                size,
+                content_type=content_type,
+            )
+            return object_name, size, digest.hexdigest()
         except Exception as exc:
-            destination.unlink(missing_ok=True)
             if isinstance(exc, ProviderError):
                 raise
-            raise ProviderError("storage", f"保存上传文件失败: {exc}") from exc
+            raise ProviderError(
+                "storage", f"上传原文件到 MinIO 失败: {exc}", retryable=True
+            ) from exc
 
-    def upload_volume(self, path: str | Path, *, owner_id: str, document_id: str) -> str | None:
-        """Mirror a local file when all Zilliz Volume settings are present."""
+    def download(self, object_name: str, destination: str | Path) -> Path:
+        """Download an object to a caller-owned temporary path for processing."""
 
-        if not self.volume_enabled:
-            return None
-        source = self._checked_path(path)
+        key = self._validate_object_name(object_name)
+        target = Path(destination)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            self._require_client().fget_object(self.bucket_name, key, str(target))
+            return target
+        except Exception as exc:
+            target.unlink(missing_ok=True)
+            raise ProviderError(
+                "storage", f"从 MinIO 下载原文件失败: {exc}", retryable=True
+            ) from exc
+
+    @staticmethod
+    def image_object_name(*, owner_id: str, document_id: str, chunk_index: int, image_index: int, extension: str) -> str:
+        if chunk_index < 0 or image_index < 0:
+            raise ValueError("图片索引不能为负数")
         owner = _safe_segment(owner_id, "owner_id")
         document = _safe_segment(document_id, "document_id")
-        volume_directory = f"documents/{owner}/{document}/"
+        suffix = extension.lower().lstrip(".")
+        if not suffix.isalnum():
+            raise ValueError("图片扩展名不受支持")
+        return f"documents/{owner}/{document}/images/{chunk_index}_{image_index}.{suffix}"
+
+    def save_image(self, source: str | Path, *, owner_id: str, document_id: str, chunk_index: int, image_index: int) -> str:
+        path = Path(source)
+        key = self.image_object_name(owner_id=owner_id, document_id=document_id, chunk_index=chunk_index, image_index=image_index, extension=path.suffix)
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         try:
-            manager = VolumeFileManager(
-                cloud_endpoint=self.volume_cloud_endpoint or "",
-                api_key=self.volume_api_key or "",
-                volume_name=self.volume_name or "",
-            )
-            manager.upload_file_to_volume(
-                source_file_path=str(source),
-                target_volume_path=volume_directory,
-            )
-            return f"{volume_directory}{source.name}"
+            with path.open("rb") as image:
+                self._require_client().put_object(self.bucket_name, key, image, path.stat().st_size, content_type=content_type)
+            return key
         except Exception as exc:
-            raise ProviderError("zilliz-volume", f"上传原文件失败: {exc}", retryable=True) from exc
+            raise ProviderError("storage", f"保存解析图片失败: {exc}", retryable=True) from exc
 
-    def delete(self, path: str | Path, volume_path: str | None = None) -> bool:
-        """Delete the local file; per-file Managed Volume deletion has no SDK API."""
-
-        del volume_path
-        target = self._checked_path(path)
-        if not target.exists():
-            return False
+    def read_image(self, object_name: str) -> tuple[bytes, str]:
+        key = self._validate_object_name(object_name)
+        response = None
         try:
-            if target.is_dir():
-                shutil.rmtree(target)
-            else:
-                target.unlink()
-            parent = target.parent
-            while parent != self.root and parent.exists() and not any(parent.iterdir()):
-                parent.rmdir()
-                parent = parent.parent
+            response = self._require_client().get_object(self.bucket_name, key)
+            return response.read(), mimetypes.guess_type(key)[0] or "application/octet-stream"
+        except Exception as exc:
+            raise ProviderError("storage", f"读取解析图片失败: {exc}", retryable=True) from exc
+        finally:
+            if response is not None:
+                response.close()
+                response.release_conn()
+
+    def delete_document_assets(self, *, owner_id: str, document_id: str) -> None:
+        prefix = f"documents/{_safe_segment(owner_id, 'owner_id')}/{_safe_segment(document_id, 'document_id')}/"
+        try:
+            objects = self._require_client().list_objects(self.bucket_name, prefix=prefix, recursive=True)
+            errors = list(self._require_client().remove_objects(
+                self.bucket_name, (DeleteObject(item.object_name) for item in objects)
+            ))
+            if errors:
+                raise ProviderError("storage", "删除文档资源失败")
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise ProviderError("storage", f"删除文档资源失败: {exc}", retryable=True) from exc
+
+    def delete(self, object_name: str) -> bool:
+        key = self._validate_object_name(object_name)
+        try:
+            self._require_client().remove_object(self.bucket_name, key)
             return True
-        except OSError as exc:
-            raise ProviderError("storage", f"删除本地原文件失败: {exc}") from exc
+        except S3Error as exc:
+            if exc.code in {"NoSuchKey", "NoSuchObject"}:
+                return False
+            raise ProviderError(
+                "storage", f"删除 MinIO 原文件失败: {exc}", retryable=True
+            ) from exc
+        except Exception as exc:
+            raise ProviderError(
+                "storage", f"删除 MinIO 原文件失败: {exc}", retryable=True
+            ) from exc
 
 
-LocalStorage = LocalFileStorage
-
-__all__ = ["LocalFileStorage", "LocalStorage"]
+__all__ = ["MinioStorage"]

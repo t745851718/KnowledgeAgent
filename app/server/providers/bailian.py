@@ -7,6 +7,8 @@ them with ``await asyncio.to_thread(...)``.
 
 from __future__ import annotations
 
+import base64
+import mimetypes
 import os
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -184,14 +186,18 @@ class BailianProvider:
     ) -> list[list[float]]:
         if not items:
             raise ValueError("items 不能为空")
-        normalized: list[dict[str, Any]] = []
-        for item in items:
-            value = dict(item)
-            image = value.get("image")
-            if isinstance(image, Path):
-                value["image"] = image.resolve().as_uri()
-            normalized.append(value)
         try:
+            normalized: list[dict[str, Any]] = []
+            for item in items:
+                value = dict(item)
+                image = value.get("image")
+                if isinstance(image, Path):
+                    mime_type = mimetypes.guess_type(image.name)[0]
+                    if not mime_type or not mime_type.startswith("image/"):
+                        raise ProviderError("bailian", "无法识别图片文件类型")
+                    encoded = base64.b64encode(image.read_bytes()).decode("ascii")
+                    value["image"] = f"data:{mime_type};base64,{encoded}"
+                normalized.append(value)
             response = MultiModalEmbedding.call(
                 model=self.vl_embedding_model,
                 input=normalized,

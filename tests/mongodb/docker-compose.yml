@@ -1,0 +1,21 @@
+services:
+  mongodb:
+    image: mongo:8.0
+    container_name: mongodb
+    restart: unless-stopped
+
+    ports:
+      - "27017:27017"
+
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGODB_USERNAME:?Set MONGODB_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGODB_PASSWORD:?Set MONGODB_PASSWORD}
+
+      # Linux 6.19+ compatibility workaround
+      GLIBC_TUNABLES: "glibc.pthread.rseq=1"
+
+    volumes:
+      - mongodb_data:/data/db
+
+volumes:
+  mongodb_data:
