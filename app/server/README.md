@@ -27,11 +27,11 @@ app/server/
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/internal/v1/health/ready` | 检查 MongoDB 和 Zilliz 就绪状态 |
+| `GET` | `/internal/v1/health/ready` | 检查 MongoDB、MinIO 和 Zilliz 就绪状态；不探测百炼/MinerU |
 | `POST` | `/internal/v1/documents/ingestions` | 接收文件并启动异步入库 |
 | `GET` | `/internal/v1/documents` | 查询 owner 的文档列表 |
 | `GET` | `/internal/v1/documents/{id}` | 查询文档和处理进度 |
-| `DELETE` | `/internal/v1/documents/{id}` | 删除文档元数据、本地文件、解析产物和向量 |
+| `DELETE` | `/internal/v1/documents/{id}` | 删除文档元数据、MinIO 对象和向量 |
 | `POST` | `/internal/v1/conversations` | 创建会话 |
 | `GET` | `/internal/v1/conversations` | 查询会话列表 |
 | `GET` | `/internal/v1/conversations/{id}/messages` | 查询会话消息 |
@@ -143,19 +143,9 @@ RUN_FULL_FLOW=0 RUN_MINIO_INTEGRATION=0 UV_CACHE_DIR=/private/tmp/knowledgeagent
 
 Web 代理和真实外部依赖联调方式见 [`app/web/README.md`](../web/README.md)。
 
-### 2026-09-05 真实联调记录
+### 真实联调记录
 
-以下是迁移 MinIO 之前的历史记录：通过 Express `/api/v1` 上传 2,215,244 字节的 `AttentionIsAllYouNeed.pdf`，真实调用 MongoDB Atlas、Zilliz Cloud、Zilliz Managed Volume、MinerU 和百炼：
-
-- 文档约 50 秒进入 `indexed/completed`，写入 64 个 chunks；Zilliz 查询确认 64 条记录。
-- 非流式问答返回 6 条带页码引用，usage 为 1376 tokens。
-- SSE 问答完整返回 `start`、`delta`、`citations`、`done`，usage 为 1818 tokens。
-- MongoDB 中确认保存两条 user 消息和两条 assistant 消息。
-- 删除 API 返回 204；MongoDB 文档、Zilliz 64 条向量、本地原文件和 MinerU 处理目录均已清理，会话及其消息也已删除。
-
-该次联调创建的临时 MongoDB、Collection 数据和本地文件已清理。迁移后的原文件改由 MinIO 管理。
-
-MinIO 迁移后又完成了一轮 Markdown 真实端到端验证：HTTP 上传、MinIO 持久化、百炼向量化、Zilliz 入库、RAG 回答、MinIO 对象删除及 MongoDB/Zilliz 测试数据清理均成功。
+真实全流程测试会使用隔离的 MongoDB database、Zilliz Collection 和 MinIO bucket，验证上传、MinIO 持久化、MinerU 解析、图文融合向量化、Zilliz 入库、RAG（含 SSE 与联网来源）以及删除清理。测试结束后保留隔离资源，仅清理本次随机 owner 的文档、对象、会话、向量和系统临时目录；详见 [`tests/test_flows/README.md`](../../tests/test_flows/README.md)。
 
 ## 运行限制
 

@@ -16,7 +16,7 @@ uv run pytest -q tests/test_flows/test_offline_flow.py
 
 先确保根目录 `.env` 中的生产连接配置可用。测试通过 `tests/support.py` 派生资源名称，不改写 `.env`：MongoDB database 和 Zilliz Collection 为 `{生产名称}_test`，MinIO 为 `{生产Bucket小写名称}-test`（Bucket 不允许下划线）。首次运行创建测试资源，完成后保留它们供复用。
 
-本项目配置对应 `KnowledgeMongoDB_test`、`KnowledgeZillizCollection_test` 和 `knowledgeminio-test`。执行：
+实际测试资源名称由运行时 `.env` 中的 `MONGODB_DATABASE`、`ZILLIZ_COLLECTION` 和 `BUCKET_NAME` 派生，不固定为某组示例名称。执行：
 
 ```bash
 RUN_FULL_FLOW=1 uv run pytest -q -s tests/test_flows/test_real_flow.py
