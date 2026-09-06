@@ -1,0 +1,16 @@
+:root { --ink:#17221d; --muted:#69766f; --line:#dfe7e2; --green:#236448; --paper:#f4f7f4; }
+* { box-sizing:border-box; } body { margin:0; color:var(--ink); background:var(--paper); font:14px/1.55 Inter,system-ui,sans-serif; }
+header { display:flex; align-items:center; justify-content:space-between; padding:28px max(24px,calc((100% - 1180px)/2)); color:white; background:#173e30; }
+h1,h2,p { margin:0; } header p,.panel-title p { font-size:10px; font-weight:750; letter-spacing:.16em; opacity:.7; } h1 { margin-top:3px; font:500 28px Georgia,serif; }
+button { padding:9px 13px; color:white; background:var(--green); border:0; border-radius:9px; cursor:pointer; font:inherit; } header button { background:#eef7f1; color:#173e30; }
+main { display:grid; gap:18px; width:min(1180px,calc(100% - 32px)); margin:24px auto 50px; }
+.summary { display:grid; grid-template-columns:repeat(5,1fr); gap:12px; } .metric,.panel { padding:18px; background:white; border:1px solid var(--line); border-radius:14px; }
+.metric strong { display:block; margin-top:6px; color:var(--green); font-size:25px; } .metric span { color:var(--muted); font-size:12px; }
+.panel-title { display:flex; align-items:center; justify-content:space-between; margin-bottom:15px; } h2 { margin-top:3px; font:500 21px Georgia,serif; }
+form { display:grid; grid-template-columns:repeat(4,1fr) auto; align-items:end; gap:12px; } label { color:var(--muted); font-size:12px; }
+input { width:100%; margin-top:5px; padding:9px 10px; border:1px solid var(--line); border-radius:8px; font:inherit; } #save-status { color:var(--green); font-size:12px; }
+.records { display:grid; gap:10px; } details { border:1px solid var(--line); border-radius:10px; background:#fbfcfb; } summary { display:flex; gap:14px; padding:12px; cursor:pointer; } summary strong { flex:1; } summary span { color:var(--muted); }
+.detail { padding:0 12px 12px; } .stages { display:flex; flex-wrap:wrap; gap:7px; } .pill { padding:4px 8px; background:#eaf3ed; border-radius:999px; font-size:11px; }
+pre { max-height:360px; padding:12px; overflow:auto; white-space:pre-wrap; word-break:break-word; background:#17251e; color:#e9f5ed; border-radius:8px; font:12px/1.55 ui-monospace,monospace; }
+.empty { padding:28px; color:var(--muted); text-align:center; }
+@media(max-width:850px){ .summary{grid-template-columns:repeat(2,1fr)} form{grid-template-columns:1fr 1fr} form button{grid-column:1/-1} summary{display:grid} }

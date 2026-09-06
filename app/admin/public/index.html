@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KnowledgeAgent Admin</title><link rel="stylesheet" href="/admin/admin.css">
+</head>
+<body>
+  <header><div><p>KNOWLEDGEAGENT</p><h1>运行监控台</h1></div><button id="refresh">刷新数据</button></header>
+  <main>
+    <section class="summary" id="summary"></section>
+    <section class="panel">
+      <div class="panel-title"><div><p>RUNTIME CONFIG</p><h2>项目参数</h2></div><span id="save-status"></span></div>
+      <form id="config-form">
+        <label>检索 Top K<input name="retrieval_limit" type="number" min="1" max="200" required></label>
+        <label>重排 Top N<input name="rerank_limit" type="number" min="1" max="200" required></label>
+        <label>聊天模型<input name="chat_model" maxlength="200" required></label>
+        <button type="submit">应用运行时配置</button>
+      </form>
+    </section>
+    <section class="panel"><div class="panel-title"><div><p>INGESTION</p><h2>入库耗时</h2></div></div><div id="ingestions" class="records"></div></section>
+    <section class="panel"><div class="panel-title"><div><p>GENERATION</p><h2>模型生成与提示词</h2></div></div><div id="rag-runs" class="records"></div></section>
+  </main>
+  <template id="empty"><div class="empty">暂无数据</div></template>
+  <script src="/admin/admin.js" defer></script>
+</body>
+</html>
