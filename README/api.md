@@ -62,7 +62,7 @@ sequenceDiagram
 ### 3.1 请求格式
 
 - 普通接口使用 `Content-Type: application/json`。
-- 文件上传使用 `Content-Type: multipart/form-data`，该请求头及 boundary 应由浏览器或 HTTP 客户端自动生成。
+- 文件上传使用 `Content-Type: multipart/form-data`，该请求头及 boundary 应由浏览器或 HTTP 客户端自动生成。Markdown 文件夹上传可重复提交 `assets` 图片字段，并用 `asset_paths` JSON 数组按顺序提供包内相对路径，`markdown_path` 表示主文档在包内的路径。
 - 流式聊天响应使用 `Content-Type: text/event-stream`。
 - 字符编码统一为 UTF-8。
 - 服务端生成带资源前缀的、可按时间排序的 ID，例如 `doc_...`、`conv_...`、`msg_...` 和 `req_...`；客户端只应将其视为不透明字符串。
@@ -180,6 +180,8 @@ Express 和 FastAPI 都会在响应头返回 `X-Request-Id`，错误响应也包
   "stage": "completed",
   "progress": 100,
   "chunk_count": 86,
+  "total_images": 4,
+  "missing_images": 1,
   "error": null,
   "created_at": "2026-03-10T08:30:00Z",
   "updated_at": "2026-03-10T08:31:42Z"
@@ -196,6 +198,8 @@ Express 和 FastAPI 都会在响应头返回 `X-Request-Id`，错误响应也包
 | `stage` | string | 当前处理阶段 |
 | `progress` | integer | 估算进度，范围 `0`～`100` |
 | `chunk_count` | integer 或 null | 成功写入向量库的文本块数量 |
+| `total_images` | integer | Markdown 中解析到的图片引用总数 |
+| `missing_images` | integer | 未在上传包内找到的相对图片数 |
 | `error` | object 或 null | 失败原因；仅失败时有值 |
 | `created_at` | string | 创建时间 |
 | `updated_at` | string | 最后更新时间 |
@@ -211,6 +215,8 @@ Express 和 FastAPI 都会在响应头返回 `X-Request-Id`，错误响应也包
 | `deleting` | 正在删除原文件和向量 | 否 |
 
 `stage` 可取 `uploading`、`parsing`、`splitting`、`embedding`、`indexing`、`completed`。失败时保留失败发生前的阶段。
+
+Markdown 解析后，`total_images` 表示图片引用总数，`missing_images` 表示包内未找到的相对图片数。缺图不再导致整篇入库失败；图片描述仍作为文本入库，Web 会提示缺失数量。
 
 ### 4.2 Conversation
 
@@ -246,6 +252,11 @@ Express 和 FastAPI 都会在响应头返回 `X-Request-Id`，错误响应也包
 ```
 
 `role` 可取 `user`、`assistant`、`system`。其中 `system` 消息通常只在服务端内部使用，不应允许浏览器直接写入。
+
+知识库引用的 `source_type` 为 `knowledge`。开启联网后，Responses API 返回的 URL
+annotations 或 `web_search_call.action.sources` 会转换为 `source_type=web` 的引用，
+并增加 `url` 字段；服务只接受不含用户凭据的 HTTP(S) 地址。联网引用随 SSE 返回、
+写入 assistant 消息，并由 Web 在回答底部展示为可点击的“网络来源”。
 
 ---
 
@@ -290,6 +301,9 @@ Idempotency-Key: 91862a89-1cb1-4b43-9498-d5f733e91963
 | --- | --- | --- | --- |
 | `file` | binary | 是 | PDF、Word 或 Markdown 文件 |
 | `metadata` | JSON string | 否 | 自定义元数据，例如来源、标签 |
+| `assets` | binary，可重复 | 否 | Markdown 文件夹内的图片资源 |
+| `asset_paths` | JSON string[] | 否 | 与 `assets` 按顺序对应的包内安全相对路径 |
+| `markdown_path` | string | 否 | 主 Markdown 在上传包内的相对路径 |
 
 已支持的文件类型：
 
@@ -502,6 +516,7 @@ Accept: text/event-stream
 | `conversation_id` | string | 是 | 已创建的会话 ID |
 | `message` | string | 是 | 用户问题；去除首尾空白后不能为空 |
 | `document_ids` | string[] | 否 | 限制检索范围；省略或空数组表示检索当前用户全部已入库文档 |
+| `web_search_enabled` | boolean | 否 | 是否在本次 Responses API 生成中绑定内置 `web_search` 工具，默认 `false`；关闭时不传入联网工具 |
 | `request_id` | string | 否 | 客户端生成的请求 ID，用于重连去重和问题排查 |
 | `stream` | boolean | 否 | 是否使用 SSE；默认 `true` |
 
@@ -524,11 +539,11 @@ curl -N -X POST 'http://localhost:3001/api/v1/chat/completions' \
 
 每个事件由 `event` 和 `data` 两行组成，事件之间用空行分隔。`data` 是单行 JSON。
 
-1. `start`：已分配 assistant 消息 ID，开始生成；消息会在回答完成后持久化。
+1. `start`：已分配 assistant 消息 ID，开始生成；消息会在回答完成后持久化。默认标题为“新对话”或“新会话”时，服务会先用现有聊天模型生成侧栏摘要，`conversation_title` 随该事件返回。
 
 ```text
 event: start
-data: {"request_id":"chat_01JNYAZPZMHQH25B8R0YZ97XPK","message_id":"msg_01JNYB1BQE89CG1YBMTH07XF0H"}
+data: {"request_id":"chat_01JNYAZPZMHQH25B8R0YZ97XPK","message_id":"msg_01JNYB1BQE89CG1YBMTH07XF0H","conversation_title":"Transformer 位置编码"}
 
 ```
 
@@ -543,7 +558,7 @@ data: {"content":"因此需要位置编码表示 token 的位置。"}
 
 ```
 
-3. `citations`：本次回答使用的引用，可在生成中或生成结束前发送一次。
+3. `citations`：本次回答使用的引用，可在生成中或生成结束前发送一次。assistant 原始内容使用 `[[cite:N]]` 隐藏锚点与第 N 条知识库 citation 对应；Web 会删除锚点，并仅将该 citation 关联的图片插入锚点位置，同一图片在单条回答中只显示一次。`source_type=web` 的条目作为去重后的可点击“网络来源”展示。
 
 ```text
 event: citations
@@ -678,15 +693,16 @@ Express 将浏览器上传的 multipart 请求转发至该接口。字段与 Web
 
 已实现的 RAG 流程：
 
-以下流程由 LangGraph 准备图与回答图执行。准备图在写入 user 后并行查询 dense、sparse 和最近历史；回答图由流式/非流式共用，缓存命中时跳过生成与写入。对外 API 和 SSE 协议保持不变。
+以下流程由 LangGraph 准备图与回答图执行。准备图在写入 user 后并行查询 dense、sparse 和最近历史；默认会话标题会在正式回答前使用同一个聊天模型生成简短摘要。回答图由流式/非流式共用，缓存命中时跳过生成与写入。
 
 1. 校验会话和文档均属于 `owner_id`。
 2. 将用户消息写入 MongoDB。
-3. 使用 `qwen3-vl-embedding` 生成查询 dense 向量，使用 `qwen3.7-text-embedding` 生成查询 sparse 向量。
-4. 在 Zilliz 中执行 dense/sparse 混合检索，并按 `owner_id`、`document_id` 过滤。
-5. 使用 `qwen3.7-text-rerank` 对候选文本重排。
-6. 将高相关片段、会话上下文和用户问题传给 `deepseek-v4-flash`。
-7. 流式返回答案，完成后将 assistant 消息、引用及模型用量写入 MongoDB。
+3. 若标题仍为“新对话”或“新会话”，使用现有聊天模型根据最近对话生成摘要标题并写回会话；失败时使用首个问题的精简文本，不阻断问答。自定义标题不会被覆盖。
+4. 使用 `qwen3-vl-embedding` 生成查询 dense 向量，使用 `qwen3.7-text-embedding` 生成查询 sparse 向量。
+5. 在 Zilliz 中执行 dense/sparse 混合检索，并按 `owner_id`、`document_id` 过滤。
+6. 使用 `qwen3.7-text-rerank` 对候选文本重排。
+7. 将高相关片段、会话上下文和用户问题传给配置的聊天模型。
+8. 流式返回答案，完成后将 assistant 消息、引用及模型用量写入 MongoDB。
 
 `stream=true` 时返回第 5.10 节定义的 SSE 事件。`stream=false` 时返回：
 
@@ -704,7 +720,8 @@ Express 将浏览器上传的 multipart 请求转发至该接口。字段与 Web
     "prompt_tokens": 1530,
     "completion_tokens": 86,
     "total_tokens": 1616
-  }
+  },
+  "conversation_title": "Transformer 位置编码"
 }
 ```
 
@@ -722,9 +739,19 @@ Express 将浏览器上传的 multipart 请求转发至该接口。字段与 Web
 
 ---
 
-## 7. 数据存储实现
+## 7. 管理监控
 
-### 7.1 MongoDB
+- `GET /api/v1/admin/metrics`：返回当前进程最近 200 条入库与 RAG 记录，包含入库阶段耗时、token usage、生成速度、模型输入和输出。
+- `GET /api/v1/admin/config`：读取运行时的 `retrieval_limit`、`rerank_limit` 和 `chat_model`。
+- `PUT /api/v1/admin/config`：局部更新上述配置，立即对后续请求生效，但不写回 `.env`。
+
+内部路径对应 `/internal/v1/admin/*`，沿用 internal Bearer Token。监控数据和运行时覆盖不持久化；进程重启后记录清空，配置恢复环境值。当前 Web 是开发身份模式，生产部署必须在管理页前增加管理员认证与授权。
+
+---
+
+## 8. 数据存储实现
+
+### 8.1 MongoDB
 
 MongoDB 使用以下集合：
 
@@ -742,7 +769,7 @@ MongoDB 使用以下集合：
 - `messages`: `{ conversation_id: 1, created_at: 1 }`
 - `messages`: `{ request_id: 1 }`，unique sparse，用于避免重试产生重复 assistant 消息
 
-### 7.2 Zilliz Collection
+### 8.2 Zilliz Collection
 
 每个文本块包含：
 
@@ -760,7 +787,7 @@ MongoDB 使用以下集合：
 
 向量维度必须与实际模型配置保持一致。服务端使用双模型生成混合检索向量：`dense_vector` 来自 `qwen3-vl-embedding`，`sparse_vector` 来自 `qwen3.7-text-embedding`。文档入库和查询必须使用相同的模型组合，不能把不同模型生成的 dense 向量写入或查询同一个字段。
 
-含图块的 dense 是文本与真实图片的融合向量，sparse 仍来自文本描述。MinerU 图片仅在任务临时目录中使用；图片缺失或路径越界时任务进入 `failed`。直接上传 Markdown 支持内联、引用式和 HTML `<img>` 的 HTTP(S) URL / Base64 图片，由模型服务读取，不增加接口字段。应用不下载远程图片，也不读取服务器本地图片；单独上传的相对路径图片须先内嵌，否则入库失败。内嵌图片限 PNG/JPEG/WEBP/BMP、单张 5 MiB，并受原上传大小限制。描述依次使用 alt、title、无描述标签，不将图片 URL/Base64 写入 sparse 文本。旧版向量需重新入库更新，不会自动迁移。
+含图块的 dense 是文本与真实图片的融合向量，sparse 仍来自文本描述。MinerU 图片缺失或路径越界时任务进入 `failed`。直接上传 Markdown 支持 HTTP(S) URL / Base64 图片，也可通过 `assets` / `asset_paths` / `markdown_path` 上传文件夹包内的相对路径图片。单文件缺少相对图片时仍入库文字描述，并通过 `total_images` / `missing_images` 报告缺失数。包内路径必须经过越界校验。
 
 原文件写入 MinIO 时使用经过路径片段校验的对象键：
 
@@ -772,7 +799,7 @@ documents/{owner_id}/{document_id}/source.pdf
 
 ---
 
-## 8. 配置项
+## 9. 配置项
 
 实现读取以下主要环境变量：
 
@@ -807,14 +834,16 @@ documents/{owner_id}/{document_id}/source.pdf
 | `CHUNK_OVERLAP` | chunk 重叠字符数，默认 `200` |
 | `RETRIEVAL_LIMIT` | 混合检索返回数，默认 `30`；dense 与 sparse 各提供至少 60 个候选给 RRF |
 | `RERANK_LIMIT` | Rerank 返回数，默认 `6` |
+| `DENSE_RRF_WEIGHT` / `SPARSE_RRF_WEIGHT` | 双路 RRF 权重，默认均为 `1.0` |
+| `RRF_K` | RRF 排名平滑常数，默认 `60` |
 
 所有密钥只保存在服务端环境变量或密钥管理服务中，不应提交到 Git、写入前端代码或通过 API 响应返回。
 
 ---
 
-## 9. 验收状态
+## 10. 验收状态
 
-### 9.1 已验证
+### 10.1 已验证
 
 - FastAPI OpenAPI 可以正常生成。
 - PDF 和 Markdown 可观察到完整状态流转并达到 `indexed`；Word 使用与 PDF 相同的 MinerU 路由，已有 Provider 级测试，但本轮未重新上传 Word。
@@ -824,7 +853,7 @@ documents/{owner_id}/{document_id}/source.pdf
 - MinIO 迁移后已用真实 MongoDB、百炼、Zilliz 和本地 MinIO 完成 Markdown 上传、入库、RAG 与删除的端到端验证。
 - 2026-09-05 经 Express Web API 完成真实 PDF 端到端联调：64 个 chunks、两次 RAG 回答、4 条持久化消息，随后完成临时数据清理。
 
-### 9.2 上线前待完成
+### 10.2 上线前待完成
 
 - 客户端断开连接后，服务端取消无用的模型生成，或继续完成并可靠保存结果；两种策略需固定一种并测试。
 - 将进程内入库任务替换为持久化任务队列，并补充重试和恢复测试。

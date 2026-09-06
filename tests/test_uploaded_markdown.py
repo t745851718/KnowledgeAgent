@@ -45,13 +45,49 @@ def test_text_only_markdown_keeps_existing_split_behavior():
     assert split(text) == split_markdown(text, chunk_size=1200, overlap=10)
 
 
-@pytest.mark.parametrize("source", ["images/a.png", "/tmp/a.png", "file:///tmp/a.png",
+@pytest.mark.parametrize("source", ["/tmp/a.png", "file:///tmp/a.png",
     "https://localhost/a", "http://127.0.0.1/a", "http://169.254.169.254/a",
     "http://[::1]/a", "https://user:pass@example.com/a", "javascript:alert(1)",
     "data:image/png;base64,xxx", "data:text/html;base64,YQ=="])
 def test_invalid_or_unavailable_images_fail_explicitly(source):
     with pytest.raises(ProviderError):
         split(f"![描述](<{source}>)")
+
+
+def test_missing_relative_image_is_counted_and_caption_remains_searchable():
+    stats = {}
+    chunks = uploaded_markdown_chunks(
+        "![缺失图](images/a.png)", chunk_size=1200, overlap=10, stats=stats,
+    )
+    assert stats == {"total_images": 1, "missing_images": 1}
+    assert chunks[0].content == "缺失图"
+    assert chunks[0].image_paths == ()
+
+
+def test_folder_relative_image_resolves_inside_package(tmp_path):
+    package = tmp_path / "package"
+    document_dir = package / "notes"
+    image = document_dir / "assets" / "diagram.png"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(PNG)
+    stats = {}
+    chunks = uploaded_markdown_chunks(
+        "![流程图](assets/diagram.png)", chunk_size=1200, overlap=10,
+        asset_root=document_dir, asset_boundary=package, stats=stats,
+    )
+    assert stats == {"total_images": 1, "missing_images": 0}
+    assert chunks[0].image_paths == (image.resolve(),)
+    nested = document_dir / "chapters"
+    chunks = uploaded_markdown_chunks(
+        "![流程图](../assets/diagram.png)", chunk_size=1200, overlap=10,
+        asset_root=nested, asset_boundary=package,
+    )
+    assert chunks[0].image_paths == (image.resolve(),)
+    with pytest.raises(ProviderError, match="越出"):
+        uploaded_markdown_chunks(
+            "![越界](../../../outside.png)", chunk_size=1200, overlap=10,
+            asset_root=nested, asset_boundary=package,
+        )
 
 
 def test_missing_caption_and_long_caption():
@@ -67,8 +103,7 @@ def test_html_images_are_extracted_without_executing_html():
     visual = [chunk for chunk in chunks if chunk.image_paths]
     assert [chunk.content for chunk in visual] == ["标题\n\nHTML图片", "标题\n\n行内图"]
     assert visual[0].image_paths == (INLINE,)
-    with pytest.raises(ProviderError):
-        split('<img src="images/missing.png">')
+    assert split('<img src="images/missing.png">')[0].image_paths == ()
 
 
 def test_oversized_inline_image_rejected(monkeypatch):

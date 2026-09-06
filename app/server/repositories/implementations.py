@@ -135,6 +135,14 @@ class Repository(Protocol):
         self, *, owner_id: str | None = None, limit: int = 20
     ) -> list[Record]: ...
 
+    async def update_conversation(
+        self,
+        conversation_id: str,
+        updates: Mapping[str, Any],
+        *,
+        owner_id: str | None = None,
+    ) -> Record | None: ...
+
     async def delete_conversation(
         self, conversation_id: str, *, owner_id: str | None = None
     ) -> bool: ...
@@ -307,6 +315,30 @@ class MongoRepository:
 
         records = await asyncio.to_thread(find)
         return [serialize_record(record) or {} for record in records]
+
+    async def update_conversation(
+        self,
+        conversation_id: str,
+        updates: Mapping[str, Any],
+        *,
+        owner_id: str | None = None,
+    ) -> Record | None:
+        changes = deepcopy(dict(updates))
+        for immutable in ("_id", "id", "owner_id", "created_at"):
+            changes.pop(immutable, None)
+        changes["updated_at"] = utc_now()
+        query = self._resource_filter(conversation_id, owner_id)
+
+        def update() -> Mapping[str, Any] | None:
+            from pymongo import ReturnDocument
+
+            return self.conversations.find_one_and_update(
+                query,
+                {"$set": changes},
+                return_document=ReturnDocument.AFTER,
+            )
+
+        return serialize_record(await asyncio.to_thread(update))
 
     async def delete_conversation(
         self, conversation_id: str, *, owner_id: str | None = None
@@ -517,6 +549,24 @@ class MemoryRepository:
             reverse=True,
         )
         return [serialize_record(record) or {} for record in records[:limit]]
+
+    async def update_conversation(
+        self,
+        conversation_id: str,
+        updates: Mapping[str, Any],
+        *,
+        owner_id: str | None = None,
+    ) -> Record | None:
+        async with self._lock:
+            record = self._conversations.get(conversation_id)
+            if record is None or not self._matches_owner(record, owner_id):
+                return None
+            changes = deepcopy(dict(updates))
+            for immutable in ("_id", "id", "owner_id", "created_at"):
+                changes.pop(immutable, None)
+            record.update(changes)
+            record["updated_at"] = utc_now()
+            return serialize_record(deepcopy(record))
 
     async def delete_conversation(
         self, conversation_id: str, *, owner_id: str | None = None

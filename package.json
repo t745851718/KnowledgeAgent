@@ -24,6 +24,8 @@
   },
   "homepage": "https://github.com/t745851718/KnowledgeAgent#readme",
   "dependencies": {
-    "express": "^5.2.1"
+    "dotenv": "^16.6.1",
+    "express": "^5.2.1",
+    "katex": "^0.16.22"
   }
 }

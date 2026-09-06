@@ -95,6 +95,9 @@ async def create_ingestion(
         str | None, Header(alias="Idempotency-Key", max_length=200)
     ] = None,
     metadata: Annotated[str | None, Form()] = None,
+    assets: Annotated[list[UploadFile] | None, File()] = None,
+    asset_paths: Annotated[str | None, Form()] = None,
+    markdown_path: Annotated[str | None, Form()] = None,
 ) -> dict[str, str]:
     resolved_owner_id = _owner_id(owner_header, owner_id)
     try:
@@ -108,11 +111,22 @@ async def create_ingestion(
         ) from exc
     if not isinstance(parsed_metadata, dict):
         raise AppError(400, "INVALID_ARGUMENT", "metadata 必须是 JSON 对象")
+    try:
+        parsed_asset_paths = json.loads(asset_paths) if asset_paths else []
+    except json.JSONDecodeError as exc:
+        raise AppError(400, "INVALID_ARGUMENT", "asset_paths 必须是有效的 JSON 数组") from exc
+    if not isinstance(parsed_asset_paths, list) or not all(isinstance(item, str) for item in parsed_asset_paths):
+        raise AppError(400, "INVALID_ARGUMENT", "asset_paths 必须是字符串数组")
+    uploaded_assets = assets or []
+    if len(uploaded_assets) != len(parsed_asset_paths):
+        raise AppError(400, "INVALID_ARGUMENT", "assets 与 asset_paths 数量必须一致")
     return await _container(request).ingestion.accept(
         file,
         owner_id=resolved_owner_id,
         metadata=parsed_metadata,
         idempotency_key=idempotency_key,
+        asset_uploads=list(zip(parsed_asset_paths, uploaded_assets, strict=True)),
+        markdown_path=markdown_path,
     )
 
 
@@ -293,7 +307,11 @@ async def rag_completion(
     try:
         message, usage = await rag.complete(prepared)
         return JSONResponse(
-            content={"message": message.model_dump(), "usage": usage.model_dump()}
+            content={
+                "message": message.model_dump(),
+                "usage": usage.model_dump(),
+                "conversation_title": prepared.conversation_title,
+            }
         )
     finally:
         rag.release_request(request_id, lock)

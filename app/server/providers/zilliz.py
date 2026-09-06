@@ -24,6 +24,9 @@ class SearchHit:
     page: int | None = None
     section: str | None = None
     chunk_index: int = 0
+    source_url: str | None = None
+    source_title: str | None = None
+    source_type: str = "knowledge"
 
 
 def _literal(value: str) -> str:
@@ -248,6 +251,37 @@ class ZillizProvider:
             return self._hits(result)
         except Exception as exc:
             raise ProviderError("zilliz", f"向量检索失败: {exc}", retryable=True) from exc
+
+    def search_dense(self, dense_vector: Sequence[float], *, owner_id: str,
+                     document_ids: Sequence[str] | None = None,
+                     limit: int = 30) -> list[SearchHit]:
+        if len(dense_vector) != self.dimension:
+            raise ProviderError("zilliz", f"查询向量维度必须为 {self.dimension}")
+        try:
+            result = self.client.search(
+                self.collection_name, data=[list(dense_vector)], anns_field="dense_vector",
+                filter=self._filter(owner_id, document_ids), limit=limit,
+                output_fields=["chunk_id", "document_id", "owner_id", "content", "page", "section", "chunk_index"],
+                search_params={"metric_type": "COSINE"},
+            )
+            return self._hits(result)
+        except Exception as exc:
+            raise ProviderError("zilliz", f"dense 检索失败: {exc}", retryable=True) from exc
+
+    def search_sparse(self, sparse_vector: Mapping[int, float], *, owner_id: str,
+                      document_ids: Sequence[str] | None = None,
+                      limit: int = 30) -> list[SearchHit]:
+        try:
+            result = self.client.search(
+                self.collection_name,
+                data=[{int(key): float(value) for key, value in sparse_vector.items()}],
+                anns_field="sparse_vector", filter=self._filter(owner_id, document_ids),
+                limit=limit, search_params={"metric_type": "IP"},
+                output_fields=["chunk_id", "document_id", "owner_id", "content", "page", "section", "chunk_index"],
+            )
+            return self._hits(result)
+        except Exception as exc:
+            raise ProviderError("zilliz", f"sparse 检索失败: {exc}", retryable=True) from exc
 
     def delete_document(self, *, owner_id: str, document_id: str) -> int:
         expression = f"owner_id == {_literal(owner_id)} and document_id == {_literal(document_id)}"

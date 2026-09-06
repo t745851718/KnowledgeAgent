@@ -8,7 +8,9 @@ const els = {
   sidebar: $('#sidebar'), scrim: $('#scrim'), drawer: $('#library-drawer'), conversationList: $('#conversation-list'),
   title: $('#conversation-title'), messages: $('#messages'), empty: $('#empty-state'), form: $('#chat-form'), input: $('#message-input'),
   send: $('#send-button'), documentList: $('#document-list'), documentCount: $('#document-count'), fileInput: $('#file-input'),
+  folderInput: $('#folder-input'),
   dropZone: $('#drop-zone'), scope: $('#scope-popover'), scopeDocs: $('#scope-documents'), allDocs: $('#all-documents'), scopeLabel: $('#scope-label'),
+  webSearch: $('#web-search'),
 };
 
 async function api(path, options = {}) {
@@ -23,8 +25,18 @@ async function loadConversations() {
   try {
     const data = await api('/conversations?limit=50');
     state.conversations = data?.items || [];
+    const active = state.conversations.find((item) => item.id === state.conversationId);
+    if (active) els.title.textContent = active.title || '新对话';
     renderConversations();
   } catch (error) { renderConversations(); }
+}
+
+function applyConversationTitle(id, title) {
+  if (!id || !title) return;
+  const conversation = state.conversations.find((item) => item.id === id);
+  if (conversation) conversation.title = title;
+  if (state.conversationId === id) els.title.textContent = title;
+  renderConversations();
 }
 
 async function loadDocuments() {
@@ -127,33 +139,68 @@ function addMessage(role, content = '', citations = []) {
   showEmpty(false);
   const node = document.createElement('article');
   node.className = `message ${role}`;
-  node.innerHTML = `<div class="avatar">${role === 'assistant' ? '✦' : '你'}</div><div class="message-body"><div class="message-role">${role === 'assistant' ? 'KnowledgeAgent' : '你'}</div><div class="message-content"></div><div class="retrieved-images"></div></div>`;
-  renderMarkdown(node.querySelector('.message-content'), content);
-  renderRetrievedImages(node.querySelector('.retrieved-images'), citations);
+  node.innerHTML = `<div class="avatar">${role === 'assistant' ? '✦' : '你'}</div><div class="message-body"><div class="message-role">${role === 'assistant' ? 'KnowledgeAgent' : '你'}</div><div class="message-content"></div></div>`;
+  const messageContent = node.querySelector('.message-content');
+  if (role === 'assistant') renderAnswer(messageContent, content, citations);
+  else renderMarkdown(messageContent, content);
   els.messages.append(node); scrollChat();
   return node;
 }
 
-function renderRetrievedImages(container, citations = []) {
-  container.replaceChildren();
+function renderAnswer(container, markdown = '', citations = []) {
+  renderMarkdown(container, markdown);
   const seen = new Set();
-  citations.flatMap((citation) => citation.images || []).forEach((image) => {
-    const key = `${image.document_id}/${image.chunk_index}/${image.image_index}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    const node = document.createElement('img');
-    node.src = `${API}/documents/${encodeURIComponent(image.document_id)}/images/${image.chunk_index}/${image.image_index}`;
-    node.alt = '检索到的文档图片';
-    node.loading = 'lazy';
-    container.append(node);
+  container.querySelectorAll('.citation-anchor').forEach((anchor) => {
+    const citation = citations[Number(anchor.dataset.cite) - 1];
+    const images = (citation?.images || []).filter((image) => {
+      const key = `${image.document_id}/${image.chunk_index}/${image.image_index}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    if (!images.length) return anchor.remove();
+    const gallery = document.createElement('span');
+    gallery.className = 'inline-citation-images';
+    images.forEach((image) => {
+      const node = document.createElement('img');
+      node.src = `${API}/documents/${encodeURIComponent(image.document_id)}/images/${image.chunk_index}/${image.image_index}`;
+      node.alt = citation?.document_name ? `来自${citation.document_name}的文档图片` : '文档图片';
+      node.loading = 'lazy';
+      gallery.append(node);
+    });
+    anchor.replaceWith(gallery);
   });
+
+  const sourceUrls = new Set();
+  const webCitations = citations.flatMap((citation) => {
+    if (citation?.source_type !== 'web' || !citation.url) return [];
+    try {
+      const url = new URL(citation.url);
+      if (!['http:', 'https:'].includes(url.protocol) || sourceUrls.has(url.href)) return [];
+      sourceUrls.add(url.href);
+      return [{ citation, url }];
+    } catch { return []; }
+  });
+  if (webCitations.length) {
+    const sources = document.createElement('aside'); sources.className = 'web-citations';
+    const label = document.createElement('strong'); label.textContent = '网络来源';
+    const list = document.createElement('ul');
+    webCitations.forEach(({ citation, url }) => {
+      const item = document.createElement('li'); const link = document.createElement('a');
+      link.href = url.href; link.target = '_blank'; link.rel = 'noopener noreferrer';
+      link.textContent = citation.document_name || url.hostname;
+      item.append(link); list.append(item);
+    });
+    sources.append(label, list); container.append(sources);
+  }
 }
 
 // Render the model's Markdown without allowing model output to inject arbitrary HTML.
 function renderMarkdown(container, markdown = '') {
   const escaped = String(markdown)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;')
+    .replace(/\[\[cite:(\d+)\]\]/gi, '<span class="citation-anchor" data-cite="$1" aria-hidden="true"></span>');
   const blocks = escaped.split(/```([\w+-]*)\n?([\s\S]*?)```/g);
   let html = '';
   for (let index = 0; index < blocks.length; index += 3) {
@@ -163,9 +210,21 @@ function renderMarkdown(container, markdown = '') {
     }
   }
   container.innerHTML = html;
+  renderMath(container);
 }
 
 function inlineMarkdown(value) {
+  const math = [];
+  const protect = (formula) => {
+    const token = `MATHPLACEHOLDER${math.length}END`;
+    math.push(formula);
+    return token;
+  };
+  value = value
+    .replace(/\$\$[\s\S]+?\$\$/g, protect)
+    .replace(/\\\[[\s\S]+?\\\]/g, protect)
+    .replace(/\\\([\s\S]+?\\\)/g, protect)
+    .replace(/(^|[^\\$])\$([^\n$]+?)\$/g, (_match, prefix, formula) => `${prefix}${protect(`$${formula}$`)}`);
   let html = value.replace(/^### (.+)$/gm, '<h3>$1</h3>')
     .replace(/^## (.+)$/gm, '<h2>$1</h2>')
     .replace(/^# (.+)$/gm, '<h1>$1</h1>')
@@ -179,17 +238,37 @@ function inlineMarkdown(value) {
     .replace(/_([^_\n]+)_/g, '<em>$1</em>')
     .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
   html = html.replace(/(?:<li>[^\n]*<\/li>\n?)+/g, (list) => `<ul>${list}</ul>`);
-  return html.split(/\n{2,}/).map((paragraph) => {
+  html = html.split(/\n{2,}/).map((paragraph) => {
     if (/^<(h[1-3]|ul|blockquote|pre)/.test(paragraph.trim())) return paragraph;
     return paragraph.trim() ? `<p>${paragraph.replace(/\n/g, '<br>')}</p>` : '';
   }).join('');
+  math.forEach((formula, index) => {
+    html = html.replace(`MATHPLACEHOLDER${index}END`, formula);
+  });
+  return html;
+}
+
+function renderMath(container) {
+  if (typeof renderMathInElement !== 'function') return;
+  renderMathInElement(container, {
+    delimiters: [
+      { left: '$$', right: '$$', display: true },
+      { left: '\\[', right: '\\]', display: true },
+      { left: '$', right: '$', display: false },
+      { left: '\\(', right: '\\)', display: false },
+    ],
+    ignoredTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'],
+    throwOnError: false,
+    strict: 'ignore',
+    trust: false,
+  });
 }
 
 async function sendMessage(text) {
   if (state.streaming) return;
   if (!state.conversationId) {
     try {
-      const created = await api('/conversations', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ title: text.slice(0, 28) }) });
+      const created = await api('/conversations', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ title: '新对话' }) });
       state.conversationId = created.id; state.conversations.unshift(created); els.title.textContent = created.title; renderConversations();
     } catch (error) { return toast(error.message); }
   }
@@ -200,13 +279,14 @@ async function sendMessage(text) {
   try {
     const response = await fetch(`${API}/chat/completions`, {
       method:'POST', headers:{'Content-Type':'application/json','Accept':'text/event-stream'},
-      body: JSON.stringify({ conversation_id: state.conversationId, message: text, document_ids: els.allDocs.checked ? [] : [...state.selectedDocuments], request_id: crypto.randomUUID() }),
+      body: JSON.stringify({ conversation_id: state.conversationId, message: text, document_ids: els.allDocs.checked ? [] : [...state.selectedDocuments], web_search_enabled: els.webSearch.checked, request_id: crypto.randomUUID() }),
     });
     if (!response.ok) { const error = await response.json().catch(() => ({})); throw new Error(error.message || `请求失败 (${response.status})`); }
     await consumeSSE(response.body, (event, data) => {
-      if (event === 'delta') renderMarkdown(content, `${content.dataset.raw || ''}${data.content || ''}`);
+      if (event === 'start' && data.conversation_title) applyConversationTitle(state.conversationId, data.conversation_title);
+      if (event === 'delta') renderAnswer(content, `${content.dataset.raw || ''}${data.content || ''}`, []);
       if (event === 'delta') content.dataset.raw = `${content.dataset.raw || ''}${data.content || ''}`;
-      if (event === 'citations') renderRetrievedImages(assistant.querySelector('.retrieved-images'), data.items);
+      if (event === 'citations') renderAnswer(content, content.dataset.raw || '', data.items || []);
       if (event === 'error') throw new Error(data.message || '回答生成失败');
       scrollChat();
     });
@@ -237,14 +317,38 @@ async function uploadFiles(files) {
   const allowed = ['pdf','doc','docx','md','markdown'];
   for (const file of files) {
     if (!allowed.includes(extension(file.name).toLowerCase())) { toast(`${file.name}：不支持的文件类型`); continue; }
-    const form = new FormData(); form.append('file', file); form.append('metadata', JSON.stringify({ source:'web-upload' }));
-    try {
-      const data = await api('/documents', { method:'POST', headers:{'Idempotency-Key':crypto.randomUUID()}, body:form });
-      state.documents.unshift({ id:data.document_id, name:file.name, size:file.size, status:data.status, stage:'uploading', progress:0 });
-      renderDocuments(); pollDocument(data.document_id); toast(`${file.name} 已加入处理队列`);
-    } catch (error) { toast(`${file.name}：${error.message}`); }
+    await uploadOne(file);
   }
   els.fileInput.value = '';
+}
+
+async function uploadOne(file, { assets = [], assetPaths = [], markdownPath = null } = {}) {
+  const form = new FormData();
+  form.append('file', file);
+  form.append('metadata', JSON.stringify({ source: markdownPath ? 'folder-upload' : 'web-upload' }));
+  if (markdownPath) form.append('markdown_path', markdownPath);
+  assets.forEach((asset) => form.append('assets', asset));
+  if (assetPaths.length) form.append('asset_paths', JSON.stringify(assetPaths));
+  try {
+    const data = await api('/documents', { method:'POST', headers:{'Idempotency-Key':crypto.randomUUID()}, body:form });
+    state.documents.unshift({ id:data.document_id, name:file.name, size:file.size, status:data.status, stage:'uploading', progress:0 });
+    renderDocuments(); pollDocument(data.document_id); toast(`${file.name} 已加入处理队列`);
+  } catch (error) { toast(`${file.name}：${error.message}`); }
+}
+
+async function uploadFolder(fileList) {
+  const files = [...fileList];
+  const markdownFiles = files.filter((file) => ['md', 'markdown'].includes(extension(file.name).toLowerCase()));
+  const imageFiles = files.filter((file) => (file.type || '').startsWith('image/'));
+  if (!markdownFiles.length) toast('文件夹中没有 Markdown 文件');
+  for (const markdown of markdownFiles) {
+    await uploadOne(markdown, {
+      assets: imageFiles,
+      assetPaths: imageFiles.map((file) => file.webkitRelativePath || file.name),
+      markdownPath: markdown.webkitRelativePath || markdown.name,
+    });
+  }
+  els.folderInput.value = '';
 }
 
 function pollDocument(id) {
@@ -269,10 +373,11 @@ async function deleteDocument(doc) {
 
 function extension(name='') { return (name.split('.').pop() || 'FILE').toUpperCase(); }
 function documentStatus(doc) {
-  if (doc.status === 'indexed') return `${formatBytes(doc.size)} · 已入库${doc.chunk_count ? ` · ${doc.chunk_count} 个片段` : ''}`;
+  const imageStatus = doc.total_images ? ` · 图片 ${doc.total_images - doc.missing_images}/${doc.total_images}${doc.missing_images ? `（缺失 ${doc.missing_images}）` : ''}` : '';
+  if (doc.status === 'indexed') return `${formatBytes(doc.size)} · 已入库${doc.chunk_count ? ` · ${doc.chunk_count} 个片段` : ''}${imageStatus}`;
   if (doc.status === 'failed') return doc.error?.message || '处理失败';
   const stages = { queued:'等待处理', uploading:'正在上传', parsing:'正在解析', splitting:'正在切分', embedding:'正在向量化', indexing:'正在入库' };
-  return `${stages[doc.stage] || stages[doc.status] || '处理中'} · ${doc.progress || 0}%`;
+  return `${stages[doc.stage] || stages[doc.status] || '处理中'} · ${doc.progress || 0}%${imageStatus}`;
 }
 function formatBytes(bytes) { if (!bytes) return '未知大小'; const units=['B','KB','MB','GB']; const i=Math.min(Math.floor(Math.log(bytes)/Math.log(1024)),3); return `${(bytes/1024**i).toFixed(i ? 1 : 0)} ${units[i]}`; }
 function emptyNote(text) { const node=document.createElement('div'); node.className='empty-note'; node.textContent=text; return node; }
@@ -291,6 +396,7 @@ $('#new-chat').addEventListener('click', createConversation); $('#refresh-conver
 $('#library-button').addEventListener('click', openLibrary); $('#close-library').addEventListener('click', closeOverlays); els.scrim.addEventListener('click', closeOverlays);
 $('#menu-button').addEventListener('click', () => { els.sidebar.classList.add('open'); els.scrim.classList.add('open'); });
 els.fileInput.addEventListener('change', () => uploadFiles(els.fileInput.files));
+els.folderInput.addEventListener('change', () => uploadFolder(els.folderInput.files));
 for (const name of ['dragenter','dragover']) els.dropZone.addEventListener(name, (e) => { e.preventDefault(); els.dropZone.classList.add('dragging'); });
 for (const name of ['dragleave','drop']) els.dropZone.addEventListener(name, (e) => { e.preventDefault(); els.dropZone.classList.remove('dragging'); });
 els.dropZone.addEventListener('drop', (event) => uploadFiles(event.dataTransfer.files));

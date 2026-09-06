@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import dashscope
 from dashscope import MultiModalEmbedding, TextEmbedding, TextReRank
@@ -39,12 +40,20 @@ class RerankResult:
 class ChatResult:
     content: str
     usage: dict[str, int]
+    web_citations: tuple["WebCitation", ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class ChatStreamChunk:
     content: str
     usage: dict[str, int] | None = None
+    web_citations: tuple["WebCitation", ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class WebCitation:
+    title: str
+    url: str
 
 
 def _native_url(url: str | None) -> str | None:
@@ -79,6 +88,55 @@ def _content_text(content: Any) -> str:
                 parts.append(item["text"])
         return "".join(parts)
     return str(content or "")
+
+
+def _safe_web_url(value: Any) -> str | None:
+    url = str(value or "").strip()
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+    ):
+        return None
+    return url
+
+
+def _web_citations(content: Any) -> tuple[WebCitation, ...]:
+    if not isinstance(content, Sequence) or isinstance(content, (str, bytes)):
+        return ()
+    values: list[WebCitation] = []
+    seen: set[str] = set()
+
+    def add(url_value: Any, title_value: Any = None) -> None:
+        url = _safe_web_url(url_value)
+        if not url or url in seen:
+            return
+        seen.add(url)
+        hostname = urlparse(url).hostname or url
+        title = str(title_value or hostname).strip() or hostname
+        values.append(WebCitation(title=title[:200], url=url))
+
+    for block in content:
+        if not isinstance(block, Mapping):
+            continue
+        for annotation in block.get("annotations") or []:
+            if isinstance(annotation, Mapping) and annotation.get("type") == "url_citation":
+                add(annotation.get("url"), annotation.get("title"))
+        if block.get("type") == "web_search_call":
+            action = block.get("action")
+            if not isinstance(action, Mapping):
+                continue
+            for source in action.get("sources") or []:
+                if isinstance(source, Mapping):
+                    add(source.get("url"), source.get("title"))
+                else:
+                    add(source)
+    return tuple(values)
 
 
 class BailianProvider:
@@ -312,28 +370,54 @@ class BailianProvider:
                 timeout=self.timeout,
                 max_retries=2,
                 stream_usage=True,
+                use_responses_api=True,
+                output_version="responses/v1",
+                store=False,
             )
         return self._llm
 
-    def chat(self, messages: Any) -> ChatResult:
+    def _chat_runnable(self, *, web_search_enabled: bool) -> Any:
+        client = self._chat_client()
+        return client.bind_tools([{"type": "web_search"}]) if web_search_enabled else client
+
+    def chat(self, messages: Any, *, web_search_enabled: bool = False) -> ChatResult:
+        operation = "Responses API 联网生成" if web_search_enabled else "模型生成"
         try:
-            response = self._chat_client().invoke(messages)
+            response = self._chat_runnable(
+                web_search_enabled=web_search_enabled
+            ).invoke(messages)
             usage_raw = response.usage_metadata or response.response_metadata.get("token_usage") or {}
             usage = {
                 "prompt_tokens": int(usage_raw.get("input_tokens", usage_raw.get("prompt_tokens", 0))),
                 "completion_tokens": int(usage_raw.get("output_tokens", usage_raw.get("completion_tokens", 0))),
                 "total_tokens": int(usage_raw.get("total_tokens", 0)),
             }
-            return ChatResult(content=_content_text(response.content), usage=usage)
+            return ChatResult(
+                content=_content_text(response.content),
+                usage=usage,
+                web_citations=_web_citations(response.content),
+            )
         except ProviderError:
             raise
         except Exception as exc:
-            raise ProviderError("bailian", f"模型生成失败: {exc}", retryable=True) from exc
+            raise ProviderError("bailian", f"{operation}失败: {exc}", retryable=True) from exc
 
-    def stream_chat(self, messages: Any) -> Iterator[ChatStreamChunk]:
+    def stream_chat(
+        self, messages: Any, *, web_search_enabled: bool = False
+    ) -> Iterator[ChatStreamChunk]:
+        operation = "Responses API 联网流式生成" if web_search_enabled else "模型流式生成"
         try:
-            for chunk in self._chat_client().stream(messages):
+            seen_citations: set[str] = set()
+            for chunk in self._chat_runnable(
+                web_search_enabled=web_search_enabled
+            ).stream(messages):
                 content = _content_text(chunk.content)
+                citations = tuple(
+                    citation
+                    for citation in _web_citations(chunk.content)
+                    if citation.url not in seen_citations
+                )
+                seen_citations.update(item.url for item in citations)
                 usage_raw = chunk.usage_metadata or {}
                 usage = None
                 if usage_raw:
@@ -342,12 +426,16 @@ class BailianProvider:
                         "completion_tokens": int(usage_raw.get("output_tokens", 0)),
                         "total_tokens": int(usage_raw.get("total_tokens", 0)),
                     }
-                if content or usage:
-                    yield ChatStreamChunk(content=content, usage=usage)
+                if content or usage or citations:
+                    yield ChatStreamChunk(
+                        content=content,
+                        usage=usage,
+                        web_citations=citations,
+                    )
         except ProviderError:
             raise
         except Exception as exc:
-            raise ProviderError("bailian", f"模型流式生成失败: {exc}", retryable=True) from exc
+            raise ProviderError("bailian", f"{operation}失败: {exc}", retryable=True) from exc
 
 
 __all__ = [
@@ -356,4 +444,5 @@ __all__ = [
     "ChatStreamChunk",
     "EmbeddingResult",
     "RerankResult",
+    "WebCitation",
 ]

@@ -13,6 +13,7 @@ from .providers.storage import MinioStorage
 from .providers.zilliz import ZillizProvider
 from .repositories import MemoryRepository, MongoRepository, Repository
 from .services import HealthService, IngestionService, RagService, TaskSupervisor
+from ..admin import AdminService
 
 
 @dataclass(slots=True)
@@ -27,6 +28,7 @@ class Container:
     ingestion: IngestionService
     rag: RagService
     health: HealthService
+    admin: Any = None
 
     async def initialize(self) -> None:
         initialize_storage = getattr(self.storage, "initialize", None)
@@ -84,6 +86,7 @@ def build_container(settings: Settings) -> Container:
         enable_sparse=True,
     )
     supervisor = TaskSupervisor()
+    admin = AdminService(settings=settings, bailian=bailian)
     ingestion = IngestionService(
         repository=repository,
         storage=storage,
@@ -92,11 +95,13 @@ def build_container(settings: Settings) -> Container:
         zilliz=zilliz,
         settings=settings,
         supervisor=supervisor,
+        admin=admin,
     )
     rag = RagService(
         repository=repository,
         bailian=bailian,
         zilliz=zilliz,
+        admin=admin,
         settings=settings,
     )
     health = HealthService(
@@ -117,6 +122,7 @@ def build_container(settings: Settings) -> Container:
         ingestion=ingestion,
         rag=rag,
         health=health,
+        admin=admin,
     )
 
 

@@ -181,7 +181,10 @@ def test_full_ingestion_preserves_dense_sparse_alignment_and_cleans_images():
         })
         service = IngestionService(
             repository=repository,
-            storage=SimpleNamespace(download=lambda key, target: target.write_bytes(b"%PDF-test")),
+            storage=SimpleNamespace(
+                download=lambda key, target: target.write_bytes(b"%PDF-test"),
+                save_image=lambda source, **kwargs: f"stored/{kwargs['chunk_index']}_{kwargs['image_index']}{source.suffix}",
+            ),
             mineru=SimpleNamespace(parse_document=parse),
             bailian=bailian,
             zilliz=SimpleNamespace(ensure_collection=lambda: None, insert_chunks=insert),

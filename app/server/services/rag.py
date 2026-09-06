@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import re
+import time
 from collections.abc import AsyncIterator
 from contextlib import aclosing
 from dataclasses import dataclass
@@ -28,15 +31,20 @@ class PreparedRag:
     message_id: str
     model_messages: list[dict[str, str]]
     citations: list[Citation]
+    conversation_title: str | None = None
     cached_message: Message | None = None
     cached_usage: Usage | None = None
 
 
 class RagState(TypedDict, total=False):
     request: RagCompletionRequest
+    conversation: dict[str, Any]
+    conversation_title: str
     documents: list[dict[str, Any]]
     dense: list[float]
     sparse: dict[int, float]
+    dense_hits: list[SearchHit]
+    sparse_hits: list[SearchHit]
     hits: list[SearchHit]
     ranked: list[tuple[SearchHit, float]]
     history: list[dict[str, Any]]
@@ -49,6 +57,8 @@ class AnswerState(TypedDict, total=False):
     content: str
     usage: Usage
     message: Message
+    citations: list[Citation]
+    duration_ms: float
 
 
 def _emit(state: AnswerState, event: str, data: dict) -> None:
@@ -56,18 +66,37 @@ def _emit(state: AnswerState, event: str, data: dict) -> None:
         get_stream_writer()((event, data))
 
 
+def weighted_rrf(
+    branches: list[list[SearchHit]], weights: list[float], *, k: int, limit: int
+) -> list[SearchHit]:
+    """Fuse independently ranked branches while preserving the winning payload."""
+    scores: dict[str, float] = {}
+    hits: dict[str, SearchHit] = {}
+    for branch, weight in zip(branches, weights, strict=True):
+        for rank, hit in enumerate(branch, 1):
+            key = hit.source_url or hit.chunk_id
+            if not key:
+                continue
+            scores[key] = scores.get(key, 0.0) + weight / (k + rank)
+            hits.setdefault(key, hit)
+    ranked_keys = sorted(scores, key=scores.get, reverse=True)[:limit]
+    return [hits[key] for key in ranked_keys]
+
+
 class RagService:
     def __init__(self, *, repository: Repository, bailian: Any,
-                 zilliz: Any, settings: Settings) -> None:
+                 zilliz: Any, settings: Settings, admin: Any = None) -> None:
         self.repository = repository
         self.bailian = bailian
         self.zilliz = zilliz
         self.settings = settings
+        self.admin = admin
         self._request_locks: dict[str, tuple[asyncio.Lock, int]] = {}
 
         graph = StateGraph(RagState)
         for name in ("validate", "documents", "save_user", "dense_query", "sparse_query",
-                     "history", "search", "rerank", "prompt"):
+                     "history", "title", "dense_search", "sparse_search", "fuse",
+                     "rerank", "prompt"):
             graph.add_node(name, getattr(self, f"_{name}"))
         graph.add_edge(START, "validate")
         graph.add_conditional_edges(
@@ -77,9 +106,12 @@ class RagService:
         graph.add_edge("documents", "save_user")
         for name in ("dense_query", "sparse_query", "history"):
             graph.add_edge("save_user", name)
-        graph.add_edge(["dense_query", "sparse_query"], "search")
-        graph.add_edge("search", "rerank")
-        graph.add_edge(["rerank", "history"], "prompt")
+        graph.add_edge("history", "title")
+        graph.add_edge(["dense_query", "sparse_query"], "dense_search")
+        graph.add_edge(["dense_query", "sparse_query"], "sparse_search")
+        graph.add_edge(["dense_search", "sparse_search"], "fuse")
+        graph.add_edge("fuse", "rerank")
+        graph.add_edge(["rerank", "title"], "prompt")
         graph.add_edge("prompt", END)
         self.prepare_graph = graph.compile()
 
@@ -95,6 +127,9 @@ class RagService:
         answer.add_edge("generate", "save")
         answer.add_edge("save", END)
         self.answer_graph = answer.compile()
+
+    def _config(self, name: str, fallback: Any) -> Any:
+        return self.admin.value(name, fallback) if self.admin is not None else fallback
 
     async def acquire_request(self, request_id: str) -> asyncio.Lock:
         lock, users = self._request_locks.get(
@@ -150,6 +185,7 @@ class RagService:
                 or existing.get("input_message") != request.message
                 or list(existing.get("document_ids") or [])
                 != list(request.document_ids or [])
+                or bool(existing.get("web_search_enabled")) != request.web_search_enabled
             ):
                 raise AppError(
                     409,
@@ -164,10 +200,11 @@ class RagService:
                     Citation.model_validate(item)
                     for item in existing.get("citations", [])
                 ],
+                conversation_title=str(conversation.get("title") or ""),
                 cached_message=Message.model_validate(existing),
                 cached_usage=Usage.model_validate(existing.get("usage") or {}),
             )}
-        return {"request": request}
+        return {"request": request, "conversation": conversation}
 
     async def _documents(self, state: RagState) -> dict:
         request = state["request"]
@@ -194,7 +231,7 @@ class RagService:
             documents = await self.repository.list_documents(
                 request.owner_id, status="indexed"
             )
-        if not documents:
+        if not documents and not request.web_search_enabled:
             raise AppError(400, "INVALID_ARGUMENT", "当前没有可用于问答的已入库文档")
 
         return {"documents": documents}
@@ -214,10 +251,14 @@ class RagService:
         return {}
 
     async def _dense_query(self, state: RagState) -> dict:
+        if not state["documents"]:
+            return {"dense": []}
         vectors = await run_sync(self.bailian.embed_multimodal, [{"text": state["request"].message}])
         return {"dense": vectors[0]}
 
     async def _sparse_query(self, state: RagState) -> dict:
+        if not state["documents"]:
+            return {"sparse": {}}
         vectors = await run_sync(self.bailian.embed_sparse_texts,
                                  [state["request"].message], text_type="query")
         return {"sparse": vectors[0]}
@@ -225,17 +266,104 @@ class RagService:
     async def _history(self, state: RagState) -> dict:
         return {"history": await self.repository.list_messages(state["request"].conversation_id, limit=20)}
 
-    async def _search(self, state: RagState) -> dict:
-        hits = await run_sync(
-            self.zilliz.search, state["dense"], owner_id=state["request"].owner_id,
-            document_ids=[str(document["id"]) for document in state["documents"]],
-            sparse_vector=state["sparse"], limit=self.settings.retrieval_limit,
-            # RRF needs enough candidates from both vector spaces before reranking.
-            # The 30-result final pool gives the reranker coverage across long
-            # courseware documents without expanding the final prompt beyond rerank_limit.
-            candidate_limit=max(self.settings.retrieval_limit * 2, 60),
+    async def _title(self, state: RagState) -> dict:
+        conversation = state["conversation"]
+        current_title = str(conversation.get("title") or "").strip()
+        if current_title not in {"新对话", "新会话"}:
+            return {"conversation_title": current_title}
+
+        request = state["request"]
+        fallback = self._fallback_title(request.message)
+        transcript = "\n".join(
+            f"{('用户' if item.get('role') == 'user' else '助手')}：{str(item.get('content') or '')[:1000]}"
+            for item in state["history"][-6:]
+            if item.get("role") in {"user", "assistant"}
         )
-        return {"hits": hits}
+        title = fallback
+        try:
+            result = await run_sync(
+                self.bailian.chat,
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "你负责为知识库会话生成侧栏摘要标题。根据对话概括核心主题，"
+                            "输出一个简洁、具体的标题，使用对话的主要语言，最多 18 个汉字"
+                            "或 36 个其他语言字符。只输出标题，不要引号、句号、解释或前缀。"
+                        ),
+                    },
+                    {"role": "user", "content": transcript or request.message},
+                ],
+            )
+            title = self._clean_title(result.content, fallback=fallback)
+        except Exception:
+            # 标题是辅助信息，上游摘要失败不能阻断已经开始的问答请求。
+            title = fallback
+
+        try:
+            updated = await self.repository.update_conversation(
+                request.conversation_id,
+                {"title": title},
+                owner_id=request.owner_id,
+            )
+        except Exception:
+            return {"conversation_title": current_title}
+        return {"conversation_title": str((updated or {}).get("title") or current_title)}
+
+    @staticmethod
+    def _fallback_title(message: str) -> str:
+        value = re.sub(r"\s+", " ", message).strip()
+        return value if len(value) <= 28 else f"{value[:27]}…"
+
+    @staticmethod
+    def _clean_title(value: str, *, fallback: str) -> str:
+        value = re.sub(r"<think>.*?</think>", "", value, flags=re.DOTALL | re.IGNORECASE)
+        line = next((item.strip() for item in value.splitlines() if item.strip()), "")
+        line = re.sub(r"^(?:标题|摘要)\s*[:：]\s*", "", line)
+        line = re.sub(r"\s+", " ", line).strip(" \t\"'“”‘’「」『』【】《》#*`。.!！")
+        if not line:
+            return fallback
+        return line if len(line) <= 36 else f"{line[:35]}…"
+
+    async def _dense_search(self, state: RagState) -> dict:
+        if not state["documents"]:
+            return {"dense_hits": []}
+        document_ids = [str(document["id"]) for document in state["documents"]]
+        method = getattr(self.zilliz, "search_dense", None)
+        if callable(method):
+            hits = await run_sync(
+                method, state["dense"], owner_id=state["request"].owner_id,
+                document_ids=document_ids, limit=self._config("retrieval_limit", self.settings.retrieval_limit),
+            )
+        else:
+            hits = await run_sync(
+                self.zilliz.search, state["dense"], owner_id=state["request"].owner_id,
+                document_ids=document_ids, sparse_vector=state["sparse"],
+                limit=self._config("retrieval_limit", self.settings.retrieval_limit),
+                candidate_limit=max(self._config("retrieval_limit", self.settings.retrieval_limit) * 2, 60),
+            )
+        return {"dense_hits": hits}
+
+    async def _sparse_search(self, state: RagState) -> dict:
+        if not state["documents"]:
+            return {"sparse_hits": []}
+        method = getattr(self.zilliz, "search_sparse", None)
+        if not callable(method):
+            return {"sparse_hits": []}
+        hits = await run_sync(
+            method, state["sparse"], owner_id=state["request"].owner_id,
+            document_ids=[str(document["id"]) for document in state["documents"]],
+            limit=self._config("retrieval_limit", self.settings.retrieval_limit),
+        )
+        return {"sparse_hits": hits}
+
+    async def _fuse(self, state: RagState) -> dict:
+        return {"hits": weighted_rrf(
+            [state["dense_hits"], state["sparse_hits"]],
+            [self.settings.dense_rrf_weight, self.settings.sparse_rrf_weight],
+            k=self.settings.rrf_k,
+            limit=self._config("retrieval_limit", self.settings.retrieval_limit),
+        )}
 
     async def _rerank(self, state: RagState) -> dict:
         hits = state["hits"]
@@ -243,9 +371,14 @@ class RagService:
             return {"ranked": []}
         rankings = await run_sync(
             self.bailian.rerank, state["request"].message,
-            [hit.content for hit in hits], top_n=self.settings.rerank_limit,
+            [hit.content for hit in hits],
+            top_n=self._config("rerank_limit", self.settings.rerank_limit),
         )
-        return {"ranked": [(hits[item.index], item.score) for item in rankings]}
+        return {"ranked": [
+            (hits[item.index], item.score)
+            for item in rankings
+            if 0 <= item.index < len(hits)
+        ]}
 
     async def _prompt(self, state: RagState) -> dict:
         request, documents = state["request"], state["documents"]
@@ -255,7 +388,7 @@ class RagService:
         citations = [
             Citation(
                 document_id=hit.document_id,
-                document_name=names.get(hit.document_id, "未知文档"),
+                document_name=hit.source_title or names.get(hit.document_id, "未知文档"),
                 chunk_id=hit.chunk_id,
                 page=hit.page,
                 score=score,
@@ -264,19 +397,30 @@ class RagService:
                     RetrievedImage(document_id=hit.document_id, chunk_index=hit.chunk_index, image_index=index)
                     for index, _ in enumerate(image_keys.get(hit.document_id, {}).get(str(hit.chunk_index), image_keys.get(hit.document_id, {}).get(hit.chunk_index, [])))
                 ],
+                url=hit.source_url,
+                source_type="web" if hit.source_type == "web" else "knowledge",
             )
             for hit, score in ranked
         ]
         context = "\n\n".join(
-            f"[来源 {index}: {citation.document_name}]\n{citation.text}"
+            f"[[cite:{index}]]\n{citation.text}"
             for index, citation in enumerate(citations, 1)
         )
         model_messages = [
             {
                 "role": "system",
                 "content": (
-                    "你是知识库问答助手。仅根据给出的参考资料回答；资料不足时明确说明。"
-                    "不要编造来源，回答使用用户的语言。"
+                    "你是知识库问答助手。"
+                    + (
+                        "本次已开启联网搜索；回答前必须调用 web_search 获取网络信息，"
+                        "并综合网络结果与给出的知识库参考资料。"
+                        if request.web_search_enabled
+                        else "仅根据给出的参考资料回答；资料不足时明确说明。"
+                    )
+                    + "不要编造来源，回答使用用户的语言。每当答案引用某条参考资料时，"
+                    "必须把该资料开头的 [[cite:N]] 锚点原样放在对应句末或段末；"
+                    "同一句引用多条资料时可连续放置多个锚点。锚点仅供机器识别，"
+                    "禁止向用户输出‘来源 N’、‘参考资料 N’等可见编号，也不要解释锚点。"
                     "若资料出现‘第 N 页图片’或‘图片（无文字描述）’，表示原文确有图片；"
                     "不得据此声称原文没有图片。可依据相邻文字解释图片主题；"
                     "若没有图片文字描述，应明确只能还原文字上下文、不能还原图片细节。"
@@ -295,6 +439,7 @@ class RagService:
             message_id=new_message_id(),
             model_messages=model_messages,
             citations=citations,
+            conversation_title=state.get("conversation_title"),
         )}
 
     async def complete(self, prepared: PreparedRag) -> tuple[Message, Usage]:
@@ -318,13 +463,33 @@ class RagService:
 
     async def _generate(self, state: AnswerState) -> dict:
         prepared = state["prepared"]
+        started = time.perf_counter()
         if not state["stream"]:
-            result = await run_sync(self.bailian.chat, prepared.model_messages)
-            return {"content": result.content, "usage": Usage.model_validate(result.usage)}
+            if prepared.request.web_search_enabled:
+                result = await run_sync(
+                    self.bailian.chat,
+                    prepared.model_messages,
+                    web_search_enabled=True,
+                )
+            else:
+                result = await run_sync(self.bailian.chat, prepared.model_messages)
+            return {
+                "content": result.content, "usage": Usage.model_validate(result.usage),
+                "citations": self._merge_web_citations(
+                    prepared.citations, getattr(result, "web_citations", ())
+                ),
+                "duration_ms": (time.perf_counter() - started) * 1000,
+            }
 
-        iterator = self.bailian.stream_chat(prepared.model_messages)
+        if prepared.request.web_search_enabled:
+            iterator = self.bailian.stream_chat(
+                prepared.model_messages, web_search_enabled=True
+            )
+        else:
+            iterator = self.bailian.stream_chat(prepared.model_messages)
         sentinel = object()
         chunks: list[str] = []
+        web_citations: list[Any] = []
         usage = Usage()
         try:
             while True:
@@ -333,6 +498,8 @@ class RagService:
                     break
                 content = chunk if isinstance(chunk, str) else chunk.content
                 chunk_usage = None if isinstance(chunk, str) else chunk.usage
+                if not isinstance(chunk, str):
+                    web_citations.extend(getattr(chunk, "web_citations", ()))
                 if chunk_usage:
                     usage = Usage.model_validate(chunk_usage)
                 if content:
@@ -342,18 +509,57 @@ class RagService:
             close = getattr(iterator, "close", None)
             if callable(close):
                 await run_sync(close)
-        _emit(state, "citations", {"items": [item.model_dump() for item in prepared.citations]})
-        return {"content": "".join(chunks), "usage": usage}
+        citations = self._merge_web_citations(prepared.citations, web_citations)
+        _emit(state, "citations", {"items": [item.model_dump() for item in citations]})
+        return {
+            "content": "".join(chunks), "usage": usage,
+            "citations": citations,
+            "duration_ms": (time.perf_counter() - started) * 1000,
+        }
+
+    @staticmethod
+    def _merge_web_citations(
+        citations: list[Citation], sources: Any
+    ) -> list[Citation]:
+        merged = list(citations)
+        seen = {item.url for item in merged if item.url}
+        for source in sources:
+            url = str(getattr(source, "url", "") or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            title = str(getattr(source, "title", "") or url).strip() or url
+            merged.append(Citation(
+                document_id="",
+                document_name=title,
+                chunk_id=f"web_{hashlib.sha256(url.encode()).hexdigest()[:20]}",
+                score=0.0,
+                text="",
+                url=url,
+                source_type="web",
+            ))
+        return merged
 
     async def _save(self, state: AnswerState) -> dict:
         message, usage = await self._save_answer(
             state["prepared"], content=state["content"], usage=state["usage"],
+            citations=state["citations"],
         )
+        if self.admin is not None:
+            prepared = state["prepared"]
+            self.admin.record_rag(
+                request_id=str(prepared.request.request_id),
+                model=str(self._config("chat_model", getattr(self.bailian, "chat_model", self.settings.chat_model))),
+                prompt=prepared.model_messages, output=state["content"],
+                usage=usage.model_dump(), duration_ms=state.get("duration_ms", 0.0),
+                web_search_enabled=prepared.request.web_search_enabled,
+            )
         _emit(state, "done", {"finish_reason": "stop", "usage": usage.model_dump()})
         return {"message": message, "usage": usage}
 
     async def _save_answer(
-        self, prepared: PreparedRag, *, content: str, usage: Usage
+        self, prepared: PreparedRag, *, content: str, usage: Usage,
+        citations: list[Citation],
     ) -> tuple[Message, Usage]:
         message = await self.repository.create_message(
             {
@@ -361,10 +567,11 @@ class RagService:
                 "conversation_id": prepared.request.conversation_id,
                 "role": "assistant",
                 "content": content,
-                "citations": [item.model_dump() for item in prepared.citations],
+                "citations": [item.model_dump() for item in citations],
                 "request_id": prepared.request.request_id,
                 "input_message": prepared.request.message,
                 "document_ids": prepared.request.document_ids or [],
+                "web_search_enabled": prepared.request.web_search_enabled,
                 "usage": usage.model_dump(),
                 "created_at": to_iso8601(),
             }
@@ -373,8 +580,11 @@ class RagService:
 
 
     async def stream(self, prepared: PreparedRag) -> AsyncIterator[str]:
-        yield encode_sse("start", {"request_id": prepared.request.request_id,
-                                   "message_id": prepared.message_id})
+        start = {"request_id": prepared.request.request_id,
+                 "message_id": prepared.message_id}
+        if prepared.conversation_title:
+            start["conversation_title"] = prepared.conversation_title
+        yield encode_sse("start", start)
         try:
             async with aclosing(self.answer_graph.astream(
                 {"prepared": prepared, "stream": True}, stream_mode="custom",

@@ -61,9 +61,11 @@ def test_fusion_concurrency_is_bounded_and_output_order_is_preserved():
     assert vectors == [[float(i)] for i in range(8)]
 
 
-async def rag_fixture(models=None, repository=None):
+async def rag_fixture(models=None, repository=None, *, title="测试会话"):
     repository = repository or MemoryRepository()
-    await repository.create_conversation({"id": "conv_graph", "owner_id": "owner"})
+    await repository.create_conversation({
+        "id": "conv_graph", "owner_id": "owner", "title": title,
+    })
     await repository.create_document({"id": "doc_graph", "owner_id": "owner", "name": "说明", "status": "indexed"})
     models = models or Models()
     service = RagService(repository=repository, bailian=models,
@@ -101,6 +103,46 @@ def test_query_embeddings_and_history_run_in_parallel():
     asyncio.run(run())
 
 
+def test_default_conversation_gets_model_summary_before_answer_generation():
+    class SummaryModels(Models):
+        def __init__(self):
+            super().__init__()
+            self.chat_calls = []
+
+        def chat(self, messages):
+            if "侧栏摘要标题" in messages[0]["content"]:
+                self.chat_calls.append("summary")
+                assert "用户：问题" in messages[-1]["content"]
+                return ChatResult("标题：『LangChain 核心包』。", {"total_tokens": 3})
+            self.chat_calls.append("answer")
+            return ChatResult("答案", {"total_tokens": 2})
+
+    async def run():
+        models = SummaryModels()
+        service, repository, _, request = await rag_fixture(
+            models, title="新对话",
+        )
+
+        prepared = await service.prepare(request)
+
+        assert models.chat_calls == ["summary"]
+        assert prepared.conversation_title == "LangChain 核心包"
+        conversation = await repository.get_conversation(
+            request.conversation_id, owner_id=request.owner_id,
+        )
+        assert conversation["title"] == "LangChain 核心包"
+
+        stream = service.stream(prepared)
+        start = await anext(stream)
+        await stream.aclose()
+        assert '"conversation_title":"LangChain 核心包"' in start
+
+        await service.complete(prepared)
+        assert models.chat_calls == ["summary", "answer"]
+
+    asyncio.run(run())
+
+
 def test_long_documents_use_a_larger_hybrid_candidate_pool_and_preserve_image_context():
     class SearchRecorder:
         def __init__(self):
@@ -133,6 +175,9 @@ def test_long_documents_use_a_larger_hybrid_candidate_pool_and_preserve_image_co
         prompt = prepared["prepared"].model_messages[0]["content"]
         assert "不得据此声称原文没有图片" in prompt
         assert "第 1 页图片（无文字描述）" in prompt
+        assert "[[cite:1]]" in prompt
+        assert "禁止向用户输出‘来源 N’" in prompt
+        assert "[来源 1:" not in prompt
 
     asyncio.run(run())
 

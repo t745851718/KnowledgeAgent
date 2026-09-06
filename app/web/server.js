@@ -4,7 +4,13 @@ const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
 
+require('dotenv').config({
+  path: path.resolve(__dirname, '../..', '.env'),
+  override: false,
+});
+
 const DEFAULT_PORT = 3001;
+const KATEX_DIST = path.join(path.dirname(require.resolve('katex/package.json')), 'dist');
 
 function createApp(options = {}) {
   const app = express();
@@ -14,6 +20,8 @@ function createApp(options = {}) {
   const ownerId = options.ownerId || process.env.DEVELOPMENT_OWNER_ID || 'development-user';
 
   app.disable('x-powered-by');
+  app.use('/admin', express.static(path.join(__dirname, '../admin/public')));
+  app.use('/vendor/katex', express.static(KATEX_DIST));
   app.use(express.static(path.join(__dirname, 'public')));
   app.use(express.json({ limit: '1mb' }));
 
@@ -122,7 +130,7 @@ function normalizeData(payload, method, path) {
 
 function sanitizeDocument(payload) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return payload;
-  const { owner_id, storage_path, volume_path, sha256, idempotency_key, ...document } = payload;
+  const { owner_id, storage_path, volume_path, sha256, idempotency_key, image_keys, asset_keys, markdown_path, ...document } = payload;
   return document;
 }
 

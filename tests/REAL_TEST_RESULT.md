@@ -52,3 +52,45 @@ REAL_FULL_FLOW_PASS cleanup=verified resources=retained
 
 迁移最终离线回归：`40 passed, 2 skipped`。新增测试还验证了图分支失败时等待其他
 在途 SDK 调用完成后再清理文件，以及 SSE 断流后不保存部分 assistant。
+
+## 功能扩展后复验（2026-09-06）
+
+在加入图文引用渲染、可选网络检索、Markdown 文件夹上传和管理控制台后，再次使用
+真实 MongoDB、MinIO、MinerU、百炼和 Zilliz 运行完整流程：
+
+```text
+INDEXED chunks=68 fused_chunks=14
+RAG_OK citations=6 messages=4
+REAL_FULL_FLOW_PASS cleanup=verified resources=retained
+1 passed, 2 warnings in 47.47s
+```
+
+本次再次验证了真实文件上传与解析、图文融合向量、混合检索与重排、非流式回答、
+完整 SSE 事件、消息持久化和跨存储清理。测试数据已清除，隔离的测试数据库、
+Collection 和 Bucket 按测试约定保留复用；两条第三方弃用警告不影响验证结果。
+
+加入会话自动摘要后再次执行真实流程，测试会话以“新对话”创建，并断言摘要在正式
+回答前由真实聊天模型生成、写回 MongoDB，且非流式响应返回相同标题：
+
+```text
+INDEXED chunks=68 fused_chunks=14
+TITLE_OK generated=true persisted=true
+RAG_OK citations=6 messages=4
+REAL_FULL_FLOW_PASS cleanup=verified resources=retained
+1 passed, 2 warnings in 62.31s
+```
+
+将网络搜索迁移到 ChatOpenAI Responses API 后再次执行真实流程。第二次问答显式开启
+`web_search_enabled`，断言 SSE 返回 `source_type=web`，并检查 assistant 消息已持久化
+安全的 HTTP(S) 网络来源：
+
+```text
+INDEXED chunks=68 fused_chunks=14
+TITLE_OK generated=true persisted=true
+RAG_OK citations=6 web_sources=19 messages=4
+REAL_FULL_FLOW_PASS cleanup=verified resources=retained
+1 passed, 2 warnings in 74.64s
+```
+
+本次验证覆盖真实 `/responses` 流式生成、内置 `web_search` 调用、19 条联网来源的 SSE
+输出和 MongoDB 持久化，以及文档、会话、MinIO 对象和 Zilliz 向量的测试后清理。

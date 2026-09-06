@@ -49,6 +49,7 @@ Python 要求 `>=3.11`，用 `uv` 管理依赖；Web 使用 CommonJS、Express 5
 | `app/server/utils/document_chunks.py` | MinerU 图片/文字关联、页码恢复和图文分块 |
 | `app/web/server.js` | `createApp(options)`、公共/内部路径映射、可信身份注入、JSON 包装与 SSE 转发 |
 | `app/web/public/` | `index.html` 页面结构、`styles.css` 响应式样式、`app.js` 状态管理/上传轮询/聊天/SSE/引用 |
+| `app/admin/` | 进程内入库/RAG 监控、运行时参数 API 与 `/admin/` 独立控制台 |
 | `tests/server/`、`tests/test_flows/` | Python 服务测试、离线与真实全流程测试 |
 | `tests/test_multimodal_ingestion.py` | 可纳入 Git 的图文入库回归：图片关联、路径校验、融合请求、dense/sparse 对齐、临时图片清理 |
 | `app/web/test/server.test.js` | Node 内置测试运行器，覆盖代理、身份、响应字段等 |
@@ -77,11 +78,14 @@ Python 要求 `>=3.11`，用 `uv` 管理依赖；Web 使用 CommonJS、Express 5
 
 - `RagService.prepare` 先校验会话归属及请求幂等，再选择 owner 的已入库文档。`document_ids` 未提供或为空列表都表示全部已入库文档；显式指定的文档必须存在且为 `indexed`。
 - 先保存 user 消息，再进行查询向量化、Zilliz 混合检索、百炼重排，构造引用和 system prompt，加入最近 20 条 user/assistant 历史。生成完成后保存 assistant 消息、引用和 usage。
+- 默认标题为“新对话”或“新会话”时，在正式回答前使用现有聊天模型根据最近历史生成简短侧栏摘要并写回会话；失败时使用当前问题的精简文本，自定义标题不覆盖。SSE `start` 可携带 `conversation_title`，供前端在答案输出前同步侧栏与页头。
 - 准备图在保存 user 后并行执行 dense、sparse 和历史读取；检索等待双路向量，prompt 等待重排与历史。缓存命中直接结束准备图，不调用模型。生成图由流式/非流式共用；SSE 只转发 `custom` 流事件，不向浏览器暴露图状态。
 - 默认源码配置：dense 为 `qwen3-vl-embedding`、1024 维；sparse 为 `qwen3.7-text-embedding`；rerank 为 `qwen3.7-text-rerank`；chat 为 `deepseek-v4-flash`。这些是项目默认值，不是对线上模型状态的声明。
-- 入库和查询必须保持同一向量模型组合与维度。dense 使用 COSINE、sparse 使用 IP，两路结果由 RRF 合并；默认召回 20 条、重排保留 6 条。默认 Collection 为 `knowledge_agent_chunks_vl_v1`。
+- ChatOpenAI 显式使用 Responses API（`use_responses_api=True`、`output_version="responses/v1"`、`store=False`）。单次问答可通过 `web_search_enabled` 绑定内置 `{"type": "web_search"}`；关闭时不得绑定工具。网络搜索发生在回答生成阶段，不进入 dense/sparse RRF 或 rerank。
+- Responses 的 `url_citation` annotations 与兼容网关的 `web_search_call.action.sources` 都转换为 `source_type=web` 的引用，只接受无用户凭据的 HTTP(S) URL。Web 必须把联网来源显示为可点击链接；SSE、消息持久化和幂等回放保留这些引用。
+- 入库和查询必须保持同一向量模型组合与维度。dense 使用 COSINE、sparse 使用 IP，由服务层加权 RRF 合并；默认召回 30 条、重排保留 6 条。默认 Collection 为 `knowledge_agent_chunks_vl_v1`。
 - 含图块的 dense 输入是 `[{"text": 块文本}, {"image": 真实图片}]`，每块独立调用 `enable_fusion=true` 返回一个向量；纯文本块仍批量嵌入。图片在 Provider 中转为 Data URI。sparse 仅输入文本，图片使用 MinerU 描述，不传图片。融合参数作用于整个请求，不能把多个 chunk 一起融合。
-- `_mineru_chunks` 从 content-list 关联图片；无 content-list 时 `_mineru_markdown_chunks` 从 MinerU Markdown 内联图片恢复关联，页码为空。图片必须存在且解析后的路径位于解析目录内，否则入库失败。直接上传的 Markdown 由 `utils/markdown_chunks.py` 解析内联、引用式与 HTML `<img>` 图片（代码示例除外），将 HTTP(S) URL 或 Base64 Data URI 作为真实图片输入交给模型服务；应用不下载远程图片。单独上传不包含相对路径图片，遇到本地路径会明确失败，需先内嵌图片。描述取 alt、title 或无描述标签，sparse 不接收图片 URL/Base64。`image_paths` 支持本地 Path 或图片输入字符串，不写入 Zilliz；MinerU 临时图片随任务清理。
+- `_mineru_chunks` 从 content-list 关联图片；无 content-list 时 `_mineru_markdown_chunks` 从 MinerU Markdown 内联图片恢复关联，页码为空。MinerU 图片必须存在且路径位于解析目录内。直接上传 Markdown 支持 HTTP(S) URL、Base64 Data URI 与文件夹包内相对图片；包内路径必须在 package root 中。单文件缺少相对图片时保留描述文字入库，并写入 `total_images/missing_images` 供前端提示。
 - 旧版含图文档需重新入库才能获得融合向量，不自动修改已有向量或删除用户数据。
 - 更换模型或维度要考虑新 Collection 或全量重建，不能混写不同向量空间。已有 Collection 的检查主要覆盖维度和 sparse 字段，不能自动发现同维度模型更换。
 - 检索和向量删除必须保留 owner 过滤；chunk ID 为 `{document_id}_{chunk_index}`。Milvus 字符串限制按 UTF-8 字节：owner 128、content 65535、section 1024；不要仅按字符数判断。
@@ -98,7 +102,7 @@ Python 要求 `>=3.11`，用 `uv` 管理依赖；Web 使用 CommonJS、Express 5
 
 - FastAPI 成功响应直接返回资源；Express 将 JSON 成功响应包装为 `{code: "OK", message, data}`，删除成功为 204。错误包含 `code/message/request_id`，可带 `details`。不要给 SSE 加 JSON 外壳。
 - SSE 顺序为 `start → delta* → citations → done`；流建立后的失败通过 `error` 事件发送。前端通过 POST `fetch` 和 `ReadableStream` 消费，代理需保持流式传输和禁用缓冲的响应头。
-- JSON 非流式 RAG 返回 `{message, usage}`。流式 `done` 在 assistant 持久化后发送；中断或失败不保证保存完整 assistant。
+- JSON 非流式 RAG 返回 `{message, usage, conversation_title}`。流式 `done` 在 assistant 持久化后发送；中断或失败不保证保存完整 assistant。
 - `X-Request-Id` 用于追踪；RAG body 的 `request_id` 用于回答幂等，缺失时使用服务端请求 ID。二者有不同校验规则，不要混淆。
 - 同一 RAG `request_id` 和相同参数可复用已保存答案；会话、问题或文档列表不一致返回 409。实现使用进程内请求锁和 MongoDB 全局唯一稀疏 `request_id` 索引。失败后仅存 user 消息的重试仍可能产生重复 user 消息，不能宣称完整 exactly-once。
 - 列表响应为 `{items, next_cursor, has_more}`，`limit` 为 1–100。实现先取记录后按 ID 切片，尚非数据库游标分页。
@@ -121,13 +125,13 @@ npm ci
 # 终端 1
 uv run uvicorn app.server.main:app --host 127.0.0.1 --port 8000 --reload
 # 终端 2
-SERVER_BASE_URL=http://127.0.0.1:8000 npm start
+npm start
 ```
 
 浏览器访问 `http://127.0.0.1:3001`；FastAPI OpenAPI 位于 `http://127.0.0.1:8000/docs`。Web 自动重启使用 `npm run dev`。若 uv 缓存权限受限，可为命令设置 `UV_CACHE_DIR=/private/tmp/knowledgeagent-uv-cache`。
 
 - Python `Settings.from_env()` 从仓库根目录加载 `.env`（`PROJECT_ROOT = Path(__file__).resolve().parents[3]`），移动配置文件时检查根目录定位测试。
-- Express 不自动读取 `.env`，所需配置应传入 Node 进程环境。尤其两端的 `INTERNAL_API_TOKEN` 必须一致。
+- Express 也从仓库根目录加载 `.env`，已存在的进程环境变量优先于文件值。两端共用 `INTERNAL_API_TOKEN`，配置后必须保持一致。
 - 完整运行需配置 `MONGODB_URI/MONGODB_DATABASE`、`MINIO_ENDPOINT/MINIO_ACCESS_KEY/MINIO_SECRET_KEY/BUCKET_NAME`、`ZILLIZ_URI/ZILLIZ_TOKEN/ZILLIZ_COLLECTION`、`MINERU_API_KEY`、`BAILIAN_BASE_URL/BAILIAN_API_KEY`（密钥支持 `DASHSCOPE_API_KEY` 回退）。详见根 README 和 `Settings`。
 - MinIO 裸 `host:port` 默认 HTTP，可由 `MINIO_SECURE` 指定；带协议 URL 按协议决定。初始化会检查并在缺失时创建 bucket；缺少 MinIO 配置会导致 lifespan 启动失败。
 - 缺少 `MONGODB_URI` 时使用内存仓储，但 ready 返回 503；这不代表整个应用进入离线模式，其他 Provider 仍需配置或注入替身。
@@ -162,5 +166,6 @@ Python 测试已统一到 `tests/`，pytest 的 `testpaths` 仅包含该目录�
 - 入库任务、RAG 请求锁和 Zilliz 文档写入锁都受单进程生命周期限制；没有持久化任务恢复、跨 worker 租约或同会话不同请求的串行化。扩展多 worker 前应专门设计这些能力。
 - MongoDB、MinIO 和 Zilliz 之间没有跨系统事务，失败清理是尽力而为；修改入库/删除需检查部分成功场景。
 - 前端每 3 秒轮询入库状态；列表未自动遍历后续分页，SSE 未自动重连。模型输出 Markdown 先转义再渲染，引用使用文本节点，保留防 HTML 注入处理。
+- Admin 监控和运行时配置只保存在当前进程；重启会清空记录并恢复环境配置。模型提示词与输出包含用户内容，生产必须增加管理员授权。
 - LangGraph 已接入，但未配置 checkpointer 或节点自动重试，不具备跨进程恢复。不要直接给上传、插入向量、保存消息节点加重试，否则可能重复写入或重复计费。仓库未提供部署编排或 CI 配置。
 - 修改接口时同步检查 `domain/models.py`、`api/routes.py`、`app/web/server.js`、`app/web/public/app.js`、`README/api.md` 及相关测试；修改模型/存储配置时同步检查 `Settings`、容器装配和启动说明。

@@ -43,6 +43,8 @@ class Document(BaseModel):
     stage: DocumentStage
     progress: int = Field(ge=0, le=100)
     chunk_count: int | None = Field(default=None, ge=0)
+    total_images: int = Field(default=0, ge=0)
+    missing_images: int = Field(default=0, ge=0)
     error: DocumentError | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     storage_path: str | None = None
@@ -78,6 +80,8 @@ class Citation(BaseModel):
     score: float
     text: str
     images: list["RetrievedImage"] = Field(default_factory=list)
+    url: str | None = None
+    source_type: Literal["knowledge", "web"] = "knowledge"
 
 
 class RetrievedImage(BaseModel):
@@ -111,6 +115,7 @@ class RagCompletionRequest(BaseModel):
     document_ids: list[str] | None = None
     request_id: str | None = Field(default=None, min_length=1, max_length=200)
     stream: bool = True
+    web_search_enabled: bool = False
 
     @field_validator("owner_id", "conversation_id", "message")
     @classmethod

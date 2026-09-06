@@ -26,6 +26,7 @@ from app.server.providers.storage import MinioStorage
 from app.server.repositories import MemoryRepository
 from app.server.services import HealthService, IngestionService, RagService, TaskSupervisor
 from tests.support import integration_settings
+from app.admin import AdminService
 
 
 class FakeBailian:
@@ -43,8 +44,8 @@ class FakeBailian:
         ]
 
     def embed_multimodal(self, items, **kwargs):
-        del kwargs
-        return [[1.0] + [0.0] * (self.dimension - 1) for _ in items]
+        count = 1 if kwargs.get("enable_fusion") else len(items)
+        return [[1.0] + [0.0] * (self.dimension - 1) for _ in range(count)]
 
     def embed_sparse_texts(self, texts, **kwargs):
         del kwargs
@@ -177,6 +178,24 @@ class MemoryObjectStorage:
         target.write_bytes(self.objects[object_name])
         return target
 
+    async def save_asset(self, upload, *, owner_id, document_id, relative_path, max_size):
+        await upload.seek(0)
+        content = await upload.read()
+        if len(content) > max_size:
+            raise AssertionError("test asset exceeds max_size")
+        key = f"documents/{owner_id}/{document_id}/assets/{relative_path}"
+        self.objects[key] = content
+        return key, len(content)
+
+    def save_image(self, source, *, owner_id, document_id, chunk_index, image_index):
+        path = Path(source)
+        key = f"documents/{owner_id}/{document_id}/images/{chunk_index}_{image_index}{path.suffix}"
+        self.objects[key] = path.read_bytes()
+        return key
+
+    def read_image(self, object_name):
+        return self.objects[object_name], "image/png"
+
     def delete(self, object_name):
         return self.objects.pop(object_name, None) is not None
 
@@ -198,6 +217,7 @@ def make_client(tmp_path: Path, *, token: str | None = None):
     repository = MemoryRepository()
     storage = MemoryObjectStorage()
     bailian = FakeBailian(settings.embedding_dimension)
+    admin = AdminService(settings=settings, bailian=bailian)
     zilliz = FakeZilliz()
     supervisor = TaskSupervisor()
     ingestion = IngestionService(
@@ -208,12 +228,14 @@ def make_client(tmp_path: Path, *, token: str | None = None):
         zilliz=zilliz,
         settings=settings,
         supervisor=supervisor,
+        admin=admin,
     )
     rag = RagService(
         repository=repository,
         bailian=bailian,
         zilliz=zilliz,
         settings=settings,
+        admin=admin,
     )
     health = HealthService(
         repository=repository,
@@ -233,6 +255,7 @@ def make_client(tmp_path: Path, *, token: str | None = None):
         ingestion=ingestion,
         rag=rag,
         health=health,
+        admin=admin,
     )
     return TestClient(create_app(settings=settings, container=container)), repository
 
@@ -328,6 +351,7 @@ def test_markdown_ingestion_status_and_delete(tmp_path: Path) -> None:
     assert deleted.status_code == 204
     assert missing.status_code == 404
     assert missing.json()["code"] == "DOCUMENT_NOT_FOUND"
+    assert client.app.state.container.storage.objects == {}
 
 
 @pytest.mark.skipif(
@@ -389,6 +413,38 @@ def test_upload_validation(tmp_path: Path) -> None:
     assert bad_metadata.json()["code"] == "INVALID_ARGUMENT"
     assert bad_type.status_code == 415
     assert bad_type.json()["code"] == "UNSUPPORTED_FILE_TYPE"
+
+
+def test_markdown_folder_assets_and_missing_counts_are_exposed(tmp_path: Path) -> None:
+    client, _ = make_client(tmp_path)
+    with client:
+        packaged = client.post(
+            "/internal/v1/documents/ingestions",
+            headers={"X-Owner-Id": "user_1"},
+            data={
+                "markdown_path": "course/guide.md",
+                "asset_paths": '["course/assets/diagram.png"]',
+            },
+            files=[
+                ("file", ("guide.md", "# 指南\n\n![流程图](assets/diagram.png)", "text/markdown")),
+                ("assets", ("diagram.png", b"\x89PNG\r\n\x1a\nimage", "image/png")),
+            ],
+        )
+        assert packaged.status_code == 202, packaged.text
+        complete = wait_until_indexed(client, packaged.json()["document_id"])
+        assert complete["status"] == "indexed", complete
+        assert complete["total_images"] == 1
+        assert complete["missing_images"] == 0
+
+        missing = client.post(
+            "/internal/v1/documents/ingestions",
+            headers={"X-Owner-Id": "user_1"},
+            files={"file": ("missing.md", "![缺失图](assets/missing.png)", "text/markdown")},
+        )
+        assert missing.status_code == 202, missing.text
+        complete = wait_until_indexed(client, missing.json()["document_id"])
+        assert complete["status"] == "indexed"
+        assert complete["total_images"] == complete["missing_images"] == 1
 
 
 def test_rag_non_stream_and_sse(tmp_path: Path) -> None:
@@ -547,3 +603,38 @@ def test_rejects_blank_request_id_and_oversized_utf8_owner(tmp_path: Path) -> No
     assert blank_request.status_code == 422
     assert oversized_owner.status_code == 400
     assert oversized_owner.json()["code"] == "INVALID_ARGUMENT"
+
+
+def test_admin_metrics_and_runtime_configuration(tmp_path: Path) -> None:
+    client, repository = make_client(tmp_path)
+    conversation_id = create_conversation(repository)
+    with client:
+        configured = client.put(
+            "/internal/v1/admin/config",
+            json={"retrieval_limit": 7, "rerank_limit": 2,
+                  "chat_model": "test-chat-model"},
+        )
+        assert configured.status_code == 200, configured.text
+        assert configured.json()["retrieval_limit"] == 7
+        assert client.app.state.container.bailian.chat_model == "test-chat-model"
+
+        document_id = upload_markdown(client)
+        assert wait_until_indexed(client, document_id)["status"] == "indexed"
+        response = client.post(
+            "/internal/v1/rag/completions",
+            json={
+                "owner_id": "user_1", "conversation_id": conversation_id,
+                "message": "位置编码是什么？", "document_ids": [document_id],
+                "request_id": "admin-observed", "stream": False,
+            },
+        )
+        assert response.status_code == 200, response.text
+        metrics = client.get("/internal/v1/admin/metrics")
+    assert metrics.status_code == 200
+    body = metrics.json()
+    assert body["summary"]["completed_ingestions"] == 1
+    assert body["summary"]["rag_requests"] == 1
+    assert body["ingestions"][0]["status"] == "indexed"
+    assert body["rag_runs"][0]["prompt"]
+    assert body["rag_runs"][0]["output"] == "这是根据知识库生成的回答。"
+    assert body["rag_runs"][0]["usage"]["completion_tokens"] == 8

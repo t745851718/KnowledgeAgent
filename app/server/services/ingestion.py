@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import mimetypes
 import shutil
 import tempfile
 from collections.abc import Mapping
@@ -11,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any, TypedDict
 
 from fastapi import UploadFile
@@ -56,6 +58,13 @@ def _looks_like_supported_file(extension: str, header: bytes) -> bool:
             return False
         return True
     return False
+
+
+def _package_path(value: str, *, field: str) -> str:
+    path = PurePosixPath(value.replace("\\", "/"))
+    if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+        raise AppError(400, "INVALID_ARGUMENT", f"{field} 不是安全的相对路径")
+    return path.as_posix()
 
 
 def _embed_dense_chunks(bailian: Any, chunks: list[TextChunk]) -> list[list[float]]:
@@ -130,7 +139,7 @@ class BatchState(TypedDict, total=False):
 class IngestionService:
     def __init__(self, *, repository: Repository, storage: Any, mineru: Any,
                  bailian: Any, zilliz: Any, settings: Settings,
-                 supervisor: TaskSupervisor) -> None:
+                 supervisor: TaskSupervisor, admin: Any = None) -> None:
         self.repository = repository
         self.storage = storage
         self.mineru = mineru
@@ -138,6 +147,7 @@ class IngestionService:
         self.zilliz = zilliz
         self.settings = settings
         self.supervisor = supervisor
+        self.admin = admin
 
         batch = StateGraph(BatchState)
         batch.add_node("dense", self._dense)
@@ -166,6 +176,8 @@ class IngestionService:
         owner_id: str,
         metadata: dict[str, Any],
         idempotency_key: str | None = None,
+        asset_uploads: list[tuple[str, UploadFile]] | None = None,
+        markdown_path: str | None = None,
     ) -> dict[str, str]:
         if idempotency_key:
             existing = await self.repository.get_document_by_idempotency_key(
@@ -214,6 +226,14 @@ class IngestionService:
             )
 
         document_id = new_document_id()
+        normalized_markdown_path = _package_path(
+            markdown_path or filename, field="markdown_path",
+        )
+        if extension not in {".md", ".markdown"} and asset_uploads:
+            raise AppError(400, "INVALID_ARGUMENT", "只有 Markdown 文档可以同时上传资源文件")
+        asset_keys: dict[str, str] = {}
+        if self.admin is not None:
+            self.admin.start_ingestion(document_id, owner_id=owner_id, name=filename)
         try:
             stored_path, size, sha256 = await self.storage.save_upload(
                 upload,
@@ -223,8 +243,37 @@ class IngestionService:
                 content_type=content_type,
                 max_size=self.settings.max_upload_size,
             )
+            total_size = size
+            for relative_path, asset in asset_uploads or []:
+                normalized = _package_path(relative_path, field="asset_paths")
+                if normalized in asset_keys:
+                    raise AppError(400, "INVALID_ARGUMENT", f"资源路径重复: {normalized}")
+                asset_type = (asset.content_type or mimetypes.guess_type(normalized)[0] or "").lower()
+                if not asset_type.startswith("image/"):
+                    raise AppError(415, "UNSUPPORTED_FILE_TYPE", f"资源必须是图片: {normalized}")
+                key, asset_size = await self.storage.save_asset(
+                    asset, owner_id=owner_id, document_id=document_id,
+                    relative_path=normalized,
+                    max_size=max(0, self.settings.max_upload_size - total_size),
+                )
+                total_size += asset_size
+                asset_keys[normalized] = key
         except ProviderError as exc:
+            await asyncio.to_thread(
+                self.storage.delete_document_assets,
+                owner_id=owner_id, document_id=document_id,
+            )
+            if self.admin is not None:
+                self.admin.finish_ingestion(document_id, status="failed", error=exc.message)
             raise _provider_app_error(exc) from exc
+        except Exception:
+            await asyncio.to_thread(
+                self.storage.delete_document_assets,
+                owner_id=owner_id, document_id=document_id,
+            )
+            if self.admin is not None:
+                self.admin.finish_ingestion(document_id, status="failed", error="上传接收失败")
+            raise
 
         now = to_iso8601()
         try:
@@ -239,9 +288,13 @@ class IngestionService:
                     "stage": "uploading",
                     "progress": 0,
                     "chunk_count": None,
+                    "total_images": 0,
+                    "missing_images": 0,
                     "error": None,
                     "metadata": metadata,
                     "storage_path": str(stored_path),
+                    "markdown_path": normalized_markdown_path,
+                    "asset_keys": asset_keys,
                     "sha256": sha256,
                     "idempotency_key": idempotency_key,
                     "created_at": now,
@@ -249,7 +302,10 @@ class IngestionService:
                 }
             )
         except Exception:
-            await asyncio.to_thread(self.storage.delete, stored_path)
+            await asyncio.to_thread(
+                self.storage.delete_document_assets,
+                owner_id=owner_id, document_id=document_id,
+            )
             if idempotency_key:
                 existing = await self.repository.get_document_by_idempotency_key(
                     owner_id, idempotency_key
@@ -259,6 +315,8 @@ class IngestionService:
                         "document_id": str(existing["id"]),
                         "status": str(existing["status"]),
                     }
+            if self.admin is not None:
+                self.admin.finish_ingestion(document_id, status="failed", error="文档元数据写入失败")
             raise
         self.supervisor.start(document_id, self._process(document))
         return {"document_id": document_id, "status": "queued"}
@@ -269,12 +327,23 @@ class IngestionService:
 
     async def _stage(self, run: IngestionRun, stage: str, **updates: Any) -> None:
         run.stage = stage
+        if self.admin is not None:
+            self.admin.stage_ingestion(run.document_id, stage)
         await self._update(run.document_id, stage=stage, **updates)
 
     async def _download(self, state: IngestionState) -> dict:
         run = state["run"]
         await self._stage(run, "parsing", status="processing", progress=10)
         await run_sync(self.storage.download, run.document["storage_path"], run.source)
+        if run.source.suffix in {".md", ".markdown"}:
+            package_root = run.root / "package"
+            markdown_path = package_root / str(run.document.get("markdown_path") or run.source.name)
+            await run_sync(markdown_path.parent.mkdir, parents=True, exist_ok=True)
+            await run_sync(shutil.copy2, run.source, markdown_path)
+            for relative_path, key in (run.document.get("asset_keys") or {}).items():
+                target = package_root / str(relative_path)
+                await run_sync(target.parent.mkdir, parents=True, exist_ok=True)
+                await run_sync(self.storage.download, key, target)
         return {}
 
     async def _parse(self, state: IngestionState) -> dict:
@@ -301,7 +370,21 @@ class IngestionService:
                     _mineru_markdown_chunks, markdown, parsed.markdown_path.parent, **options,
                 )
         else:
-            chunks = await run_sync(uploaded_markdown_chunks, state["markdown"], **options)
+            package_root = state["run"].root / "package"
+            markdown_path = package_root / str(
+                state["run"].document.get("markdown_path") or state["run"].source.name
+            )
+            stats: dict[str, int] = {}
+            chunks = await run_sync(
+                uploaded_markdown_chunks, state["markdown"], **options,
+                asset_root=markdown_path.parent, asset_boundary=package_root,
+                stats=stats,
+            )
+            await self._update(
+                state["run"].document_id,
+                total_images=stats.get("total_images", 0),
+                missing_images=stats.get("missing_images", 0),
+            )
         if not chunks:
             raise ProviderError("parser", "文档解析后没有可入库文本")
         image_keys: dict[int, list[str]] = {}
@@ -369,6 +452,8 @@ class IngestionService:
         run = state["run"]
         await self._stage(run, "completed", status="indexed", progress=100,
                           chunk_count=run.inserted, error=None)
+        if self.admin is not None:
+            self.admin.finish_ingestion(run.document_id, status="indexed")
         return {}
 
     async def _process(self, document: Mapping[str, Any]) -> None:
@@ -383,6 +468,8 @@ class IngestionService:
                     run.document_id, status="failed", stage=run.stage,
                     error={"code": "INGESTION_CANCELLED", "message": "服务关闭，文档处理被取消", "retryable": True},
                 )
+            if self.admin is not None:
+                self.admin.finish_ingestion(run.document_id, status="failed", error="入库被取消")
             raise
         except Exception as exc:
             if run.index_started:
@@ -403,6 +490,8 @@ class IngestionService:
                 error={"code": code, "message": exc.message if isinstance(exc, ProviderError) else str(exc),
                        "retryable": isinstance(exc, ProviderError) and exc.retryable},
             )
+            if self.admin is not None:
+                self.admin.finish_ingestion(run.document_id, status="failed", error=str(exc))
         finally:
             await run_sync(shutil.rmtree, run.root, True)
 

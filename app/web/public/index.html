@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="KnowledgeAgent 私有知识库问答">
   <title>KnowledgeAgent</title>
+  <link rel="stylesheet" href="/vendor/katex/katex.min.css">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -47,6 +48,7 @@
           <textarea id="message-input" rows="1" maxlength="8000" placeholder="向知识库提问…" aria-label="消息"></textarea>
           <div class="composer-actions">
             <button class="scope-button" id="scope-button" type="button"><span>◎</span><span id="scope-label">全部文档</span></button>
+            <label class="web-search-toggle"><input id="web-search" type="checkbox"> <span>联网检索</span></label>
             <span class="shortcut">Enter 发送 · Shift + Enter 换行</span>
             <button class="send-button" id="send-button" type="submit" aria-label="发送" disabled>↑</button>
           </div>
@@ -65,6 +67,10 @@
       <strong>拖入文件或点击上传</strong>
       <small>支持 PDF、Word、Markdown</small>
     </label>
+    <label class="folder-upload">
+      <input type="file" id="folder-input" webkitdirectory directory multiple>
+      上传 Markdown 文件夹（含相对路径图片）
+    </label>
     <div class="upload-list" id="document-list"></div>
   </aside>
 
@@ -74,6 +80,8 @@
     <div id="scope-documents"></div>
   </div>
   <div class="toast-region" id="toast-region" aria-live="assertive"></div>
+  <script src="/vendor/katex/katex.min.js" defer></script>
+  <script src="/vendor/katex/contrib/auto-render.min.js" defer></script>
   <script src="/app.js" defer></script>
 </body>
 </html>

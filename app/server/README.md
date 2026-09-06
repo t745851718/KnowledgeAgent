@@ -120,11 +120,13 @@ HTTP 202 仅表示任务已接受，客户端必须轮询文档详情，直到�
 - `dense_vector`：由 `qwen3-vl-embedding` 生成；含图块使用真实图片和对应文本融合，纯文本块只输入文本。
 - `sparse_vector`：由 `qwen3.7-text-embedding` 生成，只输入文本，图片使用解析描述。
 
-MinerU 图片路径仅限解析目录内的真实文件，越界或缺失时入库失败，Provider 将其编码为 Data URI。直接上传 Markdown 使用 `utils/markdown_chunks.py` 解析内联、引用式与 HTML `<img>` 图片，将 HTTP(S) URL 或 Base64 交给模型服务，不在应用中下载。相对路径图片未随 `.md` 上传，必须先内嵌，否则明确失败；不读取服务器文件。图片描述取 alt、title 或无描述标签，不能凭空补出 sparse 视觉语义。图片输入不持久化到 Zilliz。已有文档需要重新入库才能更新图文融合向量。
+MinerU 图片路径仅限解析目录内的真实文件，越界或缺失时入库失败。直接上传 Markdown 支持 HTTP(S) URL、Base64 与文件夹包内相对图片；普通单文件缺图时保留描述并记录 `total_images/missing_images`，越界或绝对路径仍拒绝。
 
-Zilliz 使用 RRF 合并两路结果，然后通过 `qwen3.7-text-rerank` 重排。查询采用同一模型组合。
+RAG 分别召回 dense、sparse 候选，使用加权 RRF 合并后通过 `qwen3.7-text-rerank` 重排。聊天 Provider 显式使用 ChatOpenAI Responses API；`web_search_enabled=true` 时在回答生成阶段绑定内置 `web_search` 工具，网络结果不进入向量召回或 rerank。
 
-RAG 查询会校验会话和指定文档均属于请求 owner，将用户消息写入 MongoDB，然后执行混合检索、重排和模型生成。`stream=true` 时依次发送 `start`、若干 `delta`、`citations`、`done`；流建立后的错误通过 `error` 事件返回。assistant 消息、引用和 usage 在生成完成后写入 MongoDB。
+RAG 查询会校验会话和指定文档均属于请求 owner，将用户消息写入 MongoDB，然后执行混合检索、重排和模型生成。若会话仍使用默认标题，会先用现有聊天模型根据最近对话生成简短侧栏摘要并持久化，失败时退回问题精简文本；自定义标题不变。联网时，Responses 返回的 URL annotations 或 `web_search_call.action.sources` 会转换为安全 HTTP(S) 引用。`stream=true` 时依次发送 `start`、若干 `delta`、`citations`、`done`，其中 `start` 可携带 `conversation_title`；流建立后的错误通过 `error` 事件返回。assistant 消息、引用和 usage 在生成完成后写入 MongoDB。
+
+`app/admin` 提供进程内监控与运行时配置。`/internal/v1/admin/metrics` 记录入库阶段耗时、生成 token/速度、提示词与输出；`/internal/v1/admin/config` 可调整检索/重排 Top K 和聊天模型。数据与覆盖均不持久化。
 
 `request_id` 用于回答幂等：相同请求参数重复提交会返回已保存的 assistant 消息；同一 `request_id` 搭配不同会话、问题或文档范围会返回 HTTP 409 `REQUEST_ID_CONFLICT`。
 

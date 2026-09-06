@@ -12,6 +12,7 @@ from .core import Settings
 from .container import Container, build_container
 from .api import install_exception_handlers, router
 from .api.security import request_id_from_header
+from ..admin.api import router as admin_router
 
 
 def create_app(
@@ -49,6 +50,7 @@ def create_app(
 
     install_exception_handlers(application)
     application.include_router(router)
+    application.include_router(admin_router)
     return application
 
 

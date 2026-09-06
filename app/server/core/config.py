@@ -81,6 +81,9 @@ class Settings:
     chunk_overlap: int = 200
     retrieval_limit: int = 30
     rerank_limit: int = 6
+    dense_rrf_weight: float = 1.0
+    sparse_rrf_weight: float = 1.0
+    rrf_k: int = 60
     probe_paid_dependencies: bool = False
 
     @classmethod
@@ -124,6 +127,9 @@ class Settings:
             chunk_overlap=_integer("CHUNK_OVERLAP", 200),
             retrieval_limit=_integer("RETRIEVAL_LIMIT", 30),
             rerank_limit=_integer("RERANK_LIMIT", 6),
+            dense_rrf_weight=_float("DENSE_RRF_WEIGHT", 1.0),
+            sparse_rrf_weight=_float("SPARSE_RRF_WEIGHT", 1.0),
+            rrf_k=_integer("RRF_K", 60),
             probe_paid_dependencies=_boolean("PROBE_PAID_DEPENDENCIES", False),
         )
 
@@ -138,3 +144,9 @@ class Settings:
             raise ValueError("CHUNK_SIZE 不能超过 60000")
         if self.chunk_overlap < 0 or self.chunk_overlap >= self.chunk_size:
             raise ValueError("CHUNK_OVERLAP 必须大于等于 0 且小于 CHUNK_SIZE")
+        if self.retrieval_limit <= 0 or self.rerank_limit <= 0:
+            raise ValueError("检索和重排数量必须大于 0")
+        if min(self.dense_rrf_weight, self.sparse_rrf_weight) < 0:
+            raise ValueError("RRF 权重不能为负数")
+        if self.rrf_k <= 0:
+            raise ValueError("RRF_K 必须大于 0")

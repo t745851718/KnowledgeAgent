@@ -172,7 +172,7 @@ def test_real_upload_parse_rag_and_cleanup_flow() -> None:
             conversation = client.post(
                 "/internal/v1/conversations",
                 headers=headers,
-                json={"title": f"Full flow {run_id}"},
+                json={"title": "新对话"},
             )
             assert conversation.status_code == 201, conversation.text
             conversation_id = conversation.json()["id"]
@@ -193,6 +193,13 @@ def test_real_upload_parse_rag_and_cleanup_flow() -> None:
             answer = completion.json()
             assert answer["message"]["content"]
             assert answer["message"]["citations"]
+            generated_title = answer["conversation_title"]
+            assert generated_title not in {"新对话", "新会话"}
+            assert 1 <= len(generated_title) <= 36
+            stored_conversation = container.repository.conversations.find_one(
+                {"_id": conversation_id, "owner_id": owner_id}
+            )
+            assert stored_conversation["title"] == generated_title
             assert all(
                 item["document_id"] == document_id
                 for item in answer["message"]["citations"]
@@ -203,19 +210,35 @@ def test_real_upload_parse_rag_and_cleanup_flow() -> None:
                 headers=headers,
                 json={
                     **request_body,
+                    "message": "请结合联网搜索补充这篇论文的公开背景，并给出可核对来源。",
                     "request_id": f"flow-sse-{run_id}",
                     "stream": True,
+                    "web_search_enabled": True,
                 },
             )
             assert streamed.status_code == 200, streamed.text
             for event in ("start", "delta", "citations", "done"):
                 assert f"event: {event}" in streamed.text
             assert "event: error" not in streamed.text
+            assert '\"source_type\":\"web\"' in streamed.text
             messages = container.repository.messages.find({"conversation_id": conversation_id})
             persisted = list(messages)
             assert len(persisted) == 4
             assert sum(item["role"] == "assistant" for item in persisted) == 2
-            print(f"RAG_OK citations={len(answer['message']['citations'])} messages={len(persisted)}")
+            web_sources = [
+                citation
+                for message in persisted
+                if message["role"] == "assistant"
+                for citation in message.get("citations") or []
+                if citation.get("source_type") == "web"
+                and str(citation.get("url") or "").startswith(("http://", "https://"))
+            ]
+            assert web_sources
+            print("TITLE_OK generated=true persisted=true")
+            print(
+                f"RAG_OK citations={len(answer['message']['citations'])} "
+                f"web_sources={len(web_sources)} messages={len(persisted)}"
+            )
 
             deleted = client.delete(
                 f"/internal/v1/documents/{document_id}", headers=headers

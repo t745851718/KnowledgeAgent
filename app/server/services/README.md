@@ -25,19 +25,20 @@ download → parse → split → index_batches → finish
 
 ```text
 validate ─ 缓存命中 → 返回已保存答案
-   └─ documents → save_user ┬─ dense_query ─┐
-                            ├─ sparse_query ┴→ search → rerank ─┐
-                            └─ history ─────────────────────────┴→ prompt
+   └─ documents → save_user ┬─ dense_query → dense_search ─┐
+                            ├─ sparse_query → sparse_search ┼→ weighted_rrf → rerank ─┐
+                            └─ history → title_summary ─────────────────────────┴→ prompt
 
 回答图：缓存 → replay
-        新请求 → generate → save
+        新请求 → generate（Responses API，可选 web_search）→ save
 ```
 
-双路查询向量和历史读取并行；无召回跳过 rerank 调用。检索准备仍在发送 SSE 响应头前
+双路查询向量和历史读取并行；默认会话标题在历史读取后、正式回答前使用现有聊天模型生成并持久化，自定义标题跳过该调用。dense、sparse 两路候选按配置权重使用 RRF 合并，无召回跳过 rerank 调用。检索准备仍在发送 SSE 响应头前
 完成，因此鉴权、文档就绪和上游检索错误保持普通 HTTP 错误响应。
 
 `complete` 和 `stream` 共用回答图。流式 `generate` 通过 `get_stream_writer` 发出
-`delta/citations`，`save` 成功后发出 `done`；API 只消费 `stream_mode="custom"`，
+`delta/citations`，`web_search_enabled=true` 时在 Responses API 生成阶段绑定内置
+`web_search`，并把 URL annotations / sources 合并到 citations；`save` 成功后发出 `done`；API 只消费 `stream_mode="custom"`，
 不返回内部 state。流建立后失败发送 `error`，不保存部分 assistant。缓存分支复用已存
 答案及 usage，不调用模型也不重复保存消息。
 

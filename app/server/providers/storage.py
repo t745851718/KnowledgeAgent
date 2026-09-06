@@ -7,6 +7,7 @@ import hashlib
 import mimetypes
 import re
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -165,6 +166,40 @@ class MinioStorage:
                 "storage", f"上传原文件到 MinIO 失败: {exc}", retryable=True
             ) from exc
 
+    @staticmethod
+    def asset_object_name(*, owner_id: str, document_id: str, relative_path: str) -> str:
+        path = PurePosixPath(relative_path.replace("\\", "/"))
+        if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+            raise ValueError("资源相对路径不合法")
+        owner = _safe_segment(owner_id, "owner_id")
+        document = _safe_segment(document_id, "document_id")
+        return f"documents/{owner}/{document}/assets/{path.as_posix()}"
+
+    async def save_asset(
+        self, upload: Any, *, owner_id: str, document_id: str,
+        relative_path: str, max_size: int,
+    ) -> tuple[str, int]:
+        key = self.asset_object_name(
+            owner_id=owner_id, document_id=document_id, relative_path=relative_path,
+        )
+        size = 0
+        try:
+            await upload.seek(0)
+            while data := await upload.read(self._CHUNK_SIZE):
+                size += len(data)
+                if size > max_size:
+                    raise ProviderError("storage", f"资源文件超过大小限制 {max_size} 字节", code="FILE_TOO_LARGE")
+            await upload.seek(0)
+            await asyncio.to_thread(
+                self._require_client().put_object, self.bucket_name, key, upload.file, size,
+                content_type=upload.content_type or mimetypes.guess_type(relative_path)[0] or "application/octet-stream",
+            )
+            return key, size
+        except Exception as exc:
+            if isinstance(exc, ProviderError):
+                raise
+            raise ProviderError("storage", f"上传 Markdown 资源失败: {exc}", retryable=True) from exc
+
     def download(self, object_name: str, destination: str | Path) -> Path:
         """Download an object to a caller-owned temporary path for processing."""
 
@@ -218,12 +253,38 @@ class MinioStorage:
     def delete_document_assets(self, *, owner_id: str, document_id: str) -> None:
         prefix = f"documents/{_safe_segment(owner_id, 'owner_id')}/{_safe_segment(document_id, 'document_id')}/"
         try:
-            objects = self._require_client().list_objects(self.bucket_name, prefix=prefix, recursive=True)
-            errors = list(self._require_client().remove_objects(
-                self.bucket_name, (DeleteObject(item.object_name) for item in objects)
+            client = self._require_client()
+            objects = list(client.list_objects(
+                self.bucket_name,
+                prefix=prefix,
+                recursive=True,
+                include_version=True,
+            ))
+            errors = list(client.remove_objects(
+                self.bucket_name,
+                (
+                    DeleteObject(item.object_name, getattr(item, "version_id", None))
+                    for item in objects
+                ),
             ))
             if errors:
-                raise ProviderError("storage", "删除文档资源失败")
+                raise ProviderError(
+                    "storage",
+                    f"删除文档资源失败，MinIO 返回 {len(errors)} 个错误",
+                    retryable=True,
+                )
+            remaining = list(client.list_objects(
+                self.bucket_name,
+                prefix=prefix,
+                recursive=True,
+                include_version=True,
+            ))
+            if remaining:
+                raise ProviderError(
+                    "storage",
+                    f"删除文档资源后仍残留 {len(remaining)} 个对象",
+                    retryable=True,
+                )
         except ProviderError:
             raise
         except Exception as exc:

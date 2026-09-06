@@ -8,7 +8,8 @@ import ipaddress
 import re
 from dataclasses import replace
 from html.parser import HTMLParser
-from urllib.parse import urlsplit
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 from markdown_it import MarkdownIt
 from markdown_it.token import Token
@@ -41,7 +42,12 @@ class _HtmlImages(HTMLParser):
         self.tokens.append(Token("text", "", 0, content=data))
 
 
-def _image_source(source: str) -> str:
+def _image_source(
+    source: str, *, asset_root: Path | None = None,
+    asset_boundary: Path | None = None, stats: dict[str, int] | None = None,
+) -> str | Path | None:
+    if stats is not None:
+        stats["total_images"] = stats.get("total_images", 0) + 1
     # Never resolve uploaded paths against the host filesystem or MinIO namespace.
     if source.startswith("data:"):
         match = re.fullmatch(r"data:image/(png|jpeg|webp|bmp);base64,([A-Za-z0-9+/=]+)", source)
@@ -54,6 +60,25 @@ def _image_source(source: str) -> str:
         if not payload or len(payload) > MAX_INLINE_IMAGE_BYTES:
             raise ProviderError("parser", "内嵌图片为空或超过 5 MiB")
         return source
+    if not urlsplit(source).scheme:
+        source_path = Path(unquote(source))
+        if source_path.is_absolute():
+            raise ProviderError("parser", "Markdown 图片路径必须是包内安全的相对路径")
+        root = asset_root.resolve() if asset_root else None
+        boundary = (asset_boundary or asset_root).resolve() if (asset_boundary or asset_root) else None
+        try:
+            candidate = (root / source_path).resolve() if root else None
+            if candidate is not None and boundary is not None and not candidate.is_relative_to(boundary):
+                raise ProviderError("parser", "Markdown 图片路径越出上传包")
+            if candidate is None or boundary is None or not candidate.is_file():
+                raise ValueError
+        except ProviderError:
+            raise
+        except (OSError, ValueError):
+            if stats is not None:
+                stats["missing_images"] = stats.get("missing_images", 0) + 1
+            return None
+        return candidate
     try:
         url = urlsplit(source)
         if url.scheme not in {"http", "https"} or not url.hostname:
@@ -81,7 +106,13 @@ def _image_source(source: str) -> str:
     return source
 
 
-def uploaded_markdown_chunks(markdown: str, *, chunk_size: int, overlap: int) -> list[TextChunk]:
+def uploaded_markdown_chunks(
+    markdown: str, *, chunk_size: int, overlap: int,
+    asset_root: Path | None = None, asset_boundary: Path | None = None,
+    stats: dict[str, int] | None = None,
+) -> list[TextChunk]:
+    if stats is not None:
+        stats.update(total_images=0, missing_images=0)
     parser = MarkdownIt("commonmark", {"html": True})
     # Parse unsafe schemes too, so our validation rejects them instead of silently
     # indexing image syntax as text. Tokens are never rendered as HTML.
@@ -103,7 +134,7 @@ def uploaded_markdown_chunks(markdown: str, *, chunk_size: int, overlap: int) ->
     headings: list[str] = []
     pending: list[str] = []
 
-    def append(text: str, image: str | None = None) -> None:
+    def append(text: str, image: str | Path | None = None) -> None:
         prefix = "\n".join(f"{'#' * (i + 1)} {title}" for i, title in enumerate(headings))
         for chunk in split_markdown(f"{prefix}\n\n{text}", chunk_size=chunk_size, overlap=overlap):
             chunks.append(replace(chunk, chunk_index=len(chunks), image_paths=(image,) if image else ()))
@@ -134,7 +165,10 @@ def uploaded_markdown_chunks(markdown: str, *, chunk_size: int, overlap: int) ->
                         text.clear()
                     flush()
                     caption = child.content.strip() or child.attrGet("title") or "图片（无文字描述）"
-                    append(caption, _image_source(child.attrGet("src") or ""))
+                    append(caption, _image_source(
+                        child.attrGet("src") or "", asset_root=asset_root,
+                        asset_boundary=asset_boundary, stats=stats,
+                    ))
                 elif child.type in {"softbreak", "hardbreak"}:
                     text.append("\n")
                 else:
